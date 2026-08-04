@@ -5,20 +5,39 @@ using System.Text.RegularExpressions;
 
 namespace FindFast.Core;
 
-public sealed class FindFastService
+public sealed class FindFastService : IDisposable
 {
     private static readonly HashSet<string> DefaultExcluded = new(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "bin", "obj", ".findfast" };
-    private const long MaxFileBytes = 10 * 1024 * 1024;
+    private const long MaxFileBytes = 64 * 1024 * 1024;
     private const int MaxQueryResults = 1000;
     private readonly SnapshotStore _store;
+    private readonly RootCatalog _catalog;
     private readonly ConcurrentDictionary<string, RootSnapshot> _snapshots = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
-    private FindFastService(SnapshotStore store) => _store = store;
+    private readonly ConcurrentDictionary<string, Regex> _regexCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentQueue<string> _regexLru = new();
+    private readonly ConcurrentDictionary<string, FileSystemWatcher> _watchers = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _debounces = new(StringComparer.Ordinal);
+    private readonly Timer _reconcileTimer;
+    private long _indexOperations, _searchOperations, _bytesIndexed, _filesIndexed, _searchElapsedMilliseconds;
+    private FindFastService(SnapshotStore store) { _store = store; _catalog = new RootCatalog(store.DataDirectory); _reconcileTimer = new Timer(_ => ReconcileAll(), null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5)); }
 
     public static async Task<FindFastService> OpenAsync(string dataDirectory, CancellationToken cancellationToken = default)
     {
         var service = new FindFastService(new SnapshotStore(dataDirectory));
-        foreach (var snapshot in await service._store.LoadAsync(cancellationToken)) service._snapshots[snapshot.Root.RootId] = snapshot;
+        var registered = await service._catalog.LoadAsync(cancellationToken);
+        foreach (var root in registered)
+        {
+            var stale = root with { State = "stale", LastError = "Index is missing or unavailable." };
+            service._snapshots[root.RootId] = new RootSnapshot { Root = stale }; service.StartWatcher(stale);
+        }
+        var migrated = false;
+        foreach (var snapshot in await service._store.LoadAsync(cancellationToken))
+        {
+            service._snapshots[snapshot.Root.RootId] = snapshot; service.StartWatcher(snapshot.Root);
+            if (!registered.Any(x => x.RootId == snapshot.Root.RootId)) { registered.Add(snapshot.Root); migrated = true; }
+        }
+        if (migrated) await service._catalog.SaveAsync(registered, cancellationToken);
         return service;
     }
 
@@ -38,14 +57,22 @@ public sealed class FindFastService
             Include = options.Include?.ToList() ?? [], Exclude = options.Exclude?.ToList() ?? [], RespectGitignore = options.RespectGitignore };
         var placeholder = new RootSnapshot { Root = root };
         _snapshots[id] = placeholder;
-        try { return (await IndexUpdateAsync(id, true, cancellationToken)).Root; }
-        catch { _snapshots.TryRemove(id, out _); throw; }
+        await SaveCatalogAsync(cancellationToken);
+        try { var indexed = await IndexUpdateAsync(id, true, cancellationToken); StartWatcher(indexed.Root); return indexed.Root; }
+        catch
+        {
+            var stale = root with { State = "stale", LastError = "Initial index build failed." };
+            _snapshots[id] = new RootSnapshot { Root = stale }; await SaveCatalogAsync(CancellationToken.None); throw;
+        }
     }
 
     public void RootRemove(string rootId)
     {
         if (!_snapshots.TryRemove(rootId, out _)) throw new KeyNotFoundException($"Unknown root: {rootId}");
+        if (_watchers.TryRemove(rootId, out var watcher)) watcher.Dispose();
+        if (_debounces.TryRemove(rootId, out var debounce)) debounce.Cancel();
         _store.Delete(rootId);
+        SaveCatalogAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
     public RootDefinition IndexStatus(string rootId) => GetSnapshot(rootId).Root;
@@ -60,7 +87,10 @@ public sealed class FindFastService
             var previous = GetSnapshot(rootId);
             var files = new List<IndexedFile>();
             var postings = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-            var nextId = 1;
+            var oldByPath = previous.Files.ToDictionary(x => x.Path, StringComparer.OrdinalIgnoreCase);
+            var oldByHash = previous.Files.GroupBy(x => x.Hash).ToDictionary(x => x.Key, x => new Queue<IndexedFile>(x));
+            var usedIds = new HashSet<int>();
+            var nextId = previous.Files.Select(x => x.FileId).Concat(previous.Tombstones.Select(x => x.FileId)).DefaultIfEmpty().Max() + 1;
             foreach (var absolute in EnumerateFiles(previous.Root))
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -68,14 +98,32 @@ public sealed class FindFastService
                 {
                     var info = new FileInfo(absolute);
                     if (info.Length > MaxFileBytes) continue;
-                    var bytes = await File.ReadAllBytesAsync(absolute, cancellationToken);
-                    if (TextIndex.IsBinary(bytes)) continue;
-                    var content = Decode(bytes);
+                    string content = string.Empty; string hash; int[] lineStarts; IEnumerable<string> fileTrigrams; string? sourcePath = null;
+                    if (info.Length > 1024 * 1024)
+                    {
+                        var probe = new byte[Math.Min(8192, (int)info.Length)];
+                        await using (var input = File.OpenRead(absolute)) _ = await input.ReadAsync(probe, cancellationToken);
+                        if (TextIndex.IsBinary(probe)) continue;
+                        var analysis = await AnalyzeLargeFileAsync(absolute, cancellationToken);
+                        hash = analysis.Hash; lineStarts = analysis.LineStarts; fileTrigrams = analysis.Trigrams; sourcePath = absolute;
+                    }
+                    else
+                    {
+                        var bytes = await File.ReadAllBytesAsync(absolute, cancellationToken);
+                        if (TextIndex.IsBinary(bytes)) continue;
+                        content = Decode(bytes);
+                        hash = TextIndex.Sha256(content); lineStarts = TextIndex.LineStarts(content); fileTrigrams = TextIndex.Trigrams(content);
+                    }
                     var relative = Path.GetRelativePath(previous.Root.Path, absolute).Replace('\\', '/');
-                    var indexed = new IndexedFile { FileId = nextId++, Path = relative, Size = info.Length,
-                        Modified = info.LastWriteTimeUtc, Hash = TextIndex.Sha256(content), Content = content, LineStarts = TextIndex.LineStarts(content) };
+                    var fileId = oldByPath.TryGetValue(relative, out var old) ? old.FileId : 0;
+                    if (fileId == 0 && oldByHash.TryGetValue(hash, out var sameContent))
+                        while (sameContent.TryDequeue(out var renamed)) if (!usedIds.Contains(renamed.FileId)) { fileId = renamed.FileId; break; }
+                    if (fileId == 0) fileId = nextId++;
+                    usedIds.Add(fileId);
+                    var indexed = new IndexedFile { FileId = fileId, Path = relative, Size = info.Length,
+                        Modified = info.LastWriteTimeUtc, Hash = hash, Content = content, LineStarts = lineStarts, SourcePath = sourcePath };
                     files.Add(indexed);
-                    foreach (var trigram in TextIndex.Trigrams(content))
+                    foreach (var trigram in fileTrigrams)
                     {
                         if (!postings.TryGetValue(trigram, out var ids)) postings[trigram] = ids = [];
                         ids.Add(indexed.FileId);
@@ -87,10 +135,19 @@ public sealed class FindFastService
             }
             var root = previous.Root with { State = "ready", Version = previous.Root.Version + 1, LastUpdated = DateTimeOffset.UtcNow,
                 LastError = null, FileCount = files.Count };
-            var snapshot = new RootSnapshot { Root = root, Files = files, Trigrams = postings };
+            var retainedTombstones = full ? Enumerable.Empty<FileTombstone>() : previous.Tombstones;
+            var tombstones = retainedTombstones.Concat(previous.Files.Where(x => !usedIds.Contains(x.FileId))
+                .Select(x => new FileTombstone(x.FileId, x.Path, root.Version))).GroupBy(x => x.FileId).Select(x => x.Last()).ToList();
+            var snapshot = new RootSnapshot { Root = root, Files = files, Trigrams = postings, Tombstones = tombstones };
             await _store.SaveAsync(snapshot, cancellationToken);
-            _snapshots[rootId] = snapshot;
-            return snapshot;
+            var published = snapshot with { Files = files.Select(x => x with { Content = string.Empty }).ToList() };
+            _snapshots[rootId] = published;
+            await SaveCatalogAsync(cancellationToken);
+            Interlocked.Increment(ref _indexOperations);
+            Interlocked.Add(ref _bytesIndexed, files.Sum(x => x.Size));
+            Interlocked.Add(ref _filesIndexed, files.Count);
+            if (full) _store.Compact(rootId);
+            return published;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -120,7 +177,6 @@ public sealed class FindFastService
         var hasNextPage = false;
         var perFileSuppressed = false;
         var snapshots = SelectSnapshots(options.RootIds);
-        var comparison = options.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
         var strategy = options.CaseSensitive && options.Query.Length >= 3 ? "trigram_then_verify" : "filtered_scan";
         try
         {
@@ -136,13 +192,10 @@ public sealed class FindFastService
                 {
                     token.ThrowIfCancellationRequested();
                     var perFile = 0;
-                    var searchAt = 0;
-                    while (searchAt <= file.Content.Length - options.Query.Length)
+                    var offsets = _store.FindLiteralAsync(snapshot.Root.RootId, snapshot.Root.Version, file.FileId, options.Query,
+                        options.CaseSensitive, options.WholeWord, maxPerFile + 1, token).GetAwaiter().GetResult();
+                    foreach (var occurrence in offsets)
                     {
-                        var found = file.Content.IndexOf(options.Query, searchAt, comparison);
-                        if (found < 0) break;
-                        searchAt = found + Math.Max(1, options.Query.Length);
-                        if (options.WholeWord && !IsWholeWord(file.Content, found, options.Query.Length)) continue;
                         if (perFile == maxPerFile)
                         {
                             perFileSuppressed = true;
@@ -155,7 +208,7 @@ public sealed class FindFastService
                             hasNextPage = true;
                             break;
                         }
-                        matches.Add(CreateMatch(snapshot.Root.RootId, file, found, options.Query.Length, context));
+                        matches.Add(CreateStreamingMatch(snapshot, file, occurrence.Offset, occurrence.Value, context, token));
                     }
                     if (hasNextPage) break;
                 }
@@ -168,11 +221,100 @@ public sealed class FindFastService
         }
         // A per-file cap deliberately removes later occurrences from the pageable universe.
         // Report that loss explicitly and do not imply they are reachable through a cursor.
+        Interlocked.Increment(ref _searchOperations); Interlocked.Add(ref _searchElapsedMilliseconds, stopwatch.ElapsedMilliseconds);
         if (perFileSuppressed)
             return Response(snapshots, strategy, candidatesTotal, matches, true, "per_file_limit", null, stopwatch.ElapsedMilliseconds);
         var cursor = hasNextPage ? EncodeCursor(offset + matches.Count) : null;
         return Response(snapshots, strategy, candidatesTotal, matches, hasNextPage, hasNextPage ? "result_limit" : null, cursor, stopwatch.ElapsedMilliseconds);
     }
+
+    public SearchResponse SearchRegex(RegexSearchOptions options, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(options.Pattern) || options.Pattern.Length > 4096) throw new ArgumentException("Pattern must contain 1 to 4096 characters.");
+        var stopwatch = Stopwatch.StartNew();
+        var snapshots = SelectSnapshots(options.RootIds);
+        var maxResults = Math.Clamp(options.MaxResults, 1, MaxQueryResults);
+        var maxPerFile = Math.Clamp(options.MaxResultsPerFile, 1, MaxQueryResults);
+        var offset = DecodeCursor(options.Cursor);
+        var literal = RequiredRegexLiteral(options.Pattern);
+        var strategy = literal is { Length: >= 3 } && options.CaseSensitive ? "trigram_then_regex" : "filtered_regex_scan";
+        var regex = GetRegex(options.Pattern, options.CaseSensitive, Math.Clamp(options.RegexTimeoutMs, 1, 5000));
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(Math.Clamp(options.TimeoutMs, 1, 60_000));
+        var matches = new List<SearchMatch>();
+        var seen = 0; var candidatesTotal = 0; var hasMore = false; var suppressed = false; var windowLimited = false;
+        try
+        {
+            foreach (var snapshot in snapshots)
+            {
+                IEnumerable<IndexedFile> candidates = snapshot.Files;
+                if (strategy == "trigram_then_regex") candidates = TrigramCandidates(snapshot, literal!);
+                var files = FilterPath(candidates, options.PathGlob).OrderBy(x => x.Path, StringComparer.Ordinal).ThenBy(x => x.FileId).ToArray();
+                candidatesTotal += files.Length;
+                foreach (var file in files)
+                {
+                    timeout.Token.ThrowIfCancellationRequested();
+                    if (file.Size > 65536 && HasUnboundedRegex(options.Pattern)) windowLimited = true;
+                    var perFile = 0;
+                    var occurrences = _store.FindRegexAsync(snapshot.Root.RootId, snapshot.Root.Version, file.FileId, regex, maxPerFile + 1, 16384, timeout.Token).GetAwaiter().GetResult();
+                    foreach (var match in occurrences)
+                    {
+                        timeout.Token.ThrowIfCancellationRequested();
+                        if (perFile == maxPerFile) { suppressed = true; break; }
+                        perFile++;
+                        if (seen++ < offset) continue;
+                        if (matches.Count == maxResults) { hasMore = true; break; }
+                        matches.Add(CreateStreamingMatch(snapshot, file, match.Offset, match.Value, Math.Clamp(options.ContextLines, 0, 20), timeout.Token));
+                    }
+                    if (hasMore) break;
+                }
+                if (hasMore) break;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        { return Response(snapshots, strategy, candidatesTotal, matches, true, "timeout", null, stopwatch.ElapsedMilliseconds); }
+        catch (RegexMatchTimeoutException)
+        { return Response(snapshots, strategy, candidatesTotal, matches, true, "regex_timeout", null, stopwatch.ElapsedMilliseconds); }
+        if (windowLimited) return Response(snapshots, "bounded_streaming_regex", candidatesTotal, matches, true, "regex_window_limit", null, stopwatch.ElapsedMilliseconds);
+        if (suppressed) return Response(snapshots, strategy, candidatesTotal, matches, true, "per_file_limit", null, stopwatch.ElapsedMilliseconds);
+        return Response(snapshots, strategy, candidatesTotal, matches, hasMore, hasMore ? "result_limit" : null,
+            hasMore ? EncodeCursor(offset + matches.Count) : null, stopwatch.ElapsedMilliseconds);
+    }
+
+    public static string? RequiredRegexLiteral(string pattern)
+    {
+        // Conservative proof: a literal prefix is mandatory when the expression has no
+        // top-level/inner alternation and begins with literals (anchors are ignored).
+        if (pattern.Contains('|')) return null;
+        var value = new StringBuilder();
+        var i = pattern.StartsWith('^') ? 1 : 0;
+        for (; i < pattern.Length; i++)
+        {
+            var c = pattern[i];
+            if (c == '\\')
+            {
+                if (++i >= pattern.Length) return null;
+                var escaped = pattern[i];
+                if ("\\.^$|?*+()[]{}".Contains(escaped)) value.Append(escaped); else break;
+            }
+            else if (".^$?*+()[]{}".Contains(c)) break;
+            else value.Append(c);
+        }
+        return value.Length == 0 ? null : value.ToString();
+    }
+
+    private Regex GetRegex(string pattern, bool caseSensitive, int timeoutMs)
+    {
+        var key = $"{caseSensitive}:{timeoutMs}:{pattern}";
+        if (_regexCache.TryGetValue(key, out var cached)) return cached;
+        var options = RegexOptions.CultureInvariant | (caseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase);
+        try { cached = new Regex(pattern, options | RegexOptions.NonBacktracking, TimeSpan.FromMilliseconds(timeoutMs)); }
+        catch (NotSupportedException) { cached = new Regex(pattern, options, TimeSpan.FromMilliseconds(timeoutMs)); }
+        _regexCache[key] = cached; _regexLru.Enqueue(key);
+        while (_regexCache.Count > 128 && _regexLru.TryDequeue(out var old)) _regexCache.TryRemove(old, out _);
+        return cached;
+    }
+    private static bool HasUnboundedRegex(string pattern) => Regex.IsMatch(pattern, @"(?<!\\)(?:\*|\+|\{\d+,\})", RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
 
     public IReadOnlyList<FileResult> FilesFind(IReadOnlyList<string>? rootIds, string? pathGlob, string? query, int maxResults,
         string? cursor, out string? nextCursor, CancellationToken cancellationToken = default)
@@ -203,9 +345,12 @@ public sealed class FindFastService
         startLine = Math.Max(1, startLine);
         endLine = Math.Max(startLine, endLine);
         var cappedEnd = Math.Min(endLine, startLine + 499);
-        var lines = SplitLines(file.Content).Skip(startLine - 1).Take(cappedEnd - startLine + 1).ToArray();
+        var lines = _store.ReadLinesAsync(rootId, snapshot.Root.Version, file.FileId, startLine, cappedEnd - startLine + 1, cancellationToken).GetAwaiter().GetResult();
         return new(rootId, file.Path, startLine, startLine + Math.Max(0, lines.Length - 1), lines, cappedEnd < endLine, snapshot.Root.Version);
     }
+
+    public MetricsSnapshot GetMetrics() => new(Interlocked.Read(ref _indexOperations), Interlocked.Read(ref _searchOperations),
+        Interlocked.Read(ref _bytesIndexed), Interlocked.Read(ref _filesIndexed), Interlocked.Read(ref _searchElapsedMilliseconds));
 
     private RootSnapshot GetSnapshot(string rootId) => _snapshots.TryGetValue(rootId, out var value) ? value : throw new KeyNotFoundException($"Unknown root: {rootId}");
     private RootSnapshot[] SelectSnapshots(IReadOnlyList<string>? ids) => (ids is null or { Count: 0 }
@@ -229,7 +374,6 @@ public sealed class FindFastService
     }
     private static IEnumerable<string> EnumerateFiles(RootDefinition root)
     {
-        var effectiveExcludes = root.Exclude.Concat(root.RespectGitignore ? LoadGitIgnore(root.Path) : []).ToArray();
         var pending = new Stack<string>(); pending.Push(root.Path);
         while (pending.TryPop(out var directory))
         {
@@ -240,31 +384,49 @@ public sealed class FindFastService
             {
                 var info = new DirectoryInfo(dir);
                 if ((info.Attributes & FileAttributes.ReparsePoint) != 0 || DefaultExcluded.Contains(info.Name)) continue;
-                if (MatchesAny(effectiveExcludes, Path.GetRelativePath(root.Path, dir).Replace('\\', '/') + "/")) continue;
+                var relativeDir = Path.GetRelativePath(root.Path, dir).Replace('\\', '/') + "/";
+                if (MatchesAny(root.Exclude, relativeDir) || (root.RespectGitignore && IsGitIgnored(root.Path, relativeDir))) continue;
                 pending.Push(dir);
             }
             foreach (var file in files)
             {
                 var relative = Path.GetRelativePath(root.Path, file).Replace('\\', '/');
-                if (MatchesAny(effectiveExcludes, relative)) continue;
+                if (MatchesAny(root.Exclude, relative) || (root.RespectGitignore && IsGitIgnored(root.Path, relative))) continue;
                 if (root.Include.Count > 0 && !MatchesAny(root.Include, relative)) continue;
                 yield return file;
             }
         }
     }
-    private static IEnumerable<string> LoadGitIgnore(string root)
+    private static bool IsGitIgnored(string root, string relative)
     {
-        var path = Path.Combine(root, ".gitignore");
-        if (!File.Exists(path)) yield break;
-        foreach (var raw in File.ReadLines(path))
+        var ignored = false;
+        var relativeDirectory = Path.GetDirectoryName(relative.Replace('/', Path.DirectorySeparatorChar)) ?? string.Empty;
+        var directories = new List<string> { string.Empty };
+        var cursor = string.Empty;
+        foreach (var part in relativeDirectory.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
         {
-            var pattern = raw.Trim();
-            if (pattern.Length == 0 || pattern[0] == '#' || pattern[0] == '!') continue;
-            pattern = pattern.TrimStart('/');
-            if (pattern.EndsWith('/')) pattern += "**";
-            if (!pattern.Contains('/')) pattern = "**/" + pattern;
-            yield return pattern;
+            cursor = cursor.Length == 0 ? part : cursor + "/" + part;
+            directories.Add(cursor);
         }
+        foreach (var baseDirectory in directories)
+        {
+            var ignoreFile = Path.Combine(root, baseDirectory.Replace('/', Path.DirectorySeparatorChar), ".gitignore");
+            if (!File.Exists(ignoreFile)) continue;
+            var local = baseDirectory.Length == 0 ? relative : relative.StartsWith(baseDirectory + "/", StringComparison.Ordinal) ? relative[(baseDirectory.Length + 1)..] : relative;
+            foreach (var raw in File.ReadLines(ignoreFile))
+            {
+                var pattern = raw.TrimEnd();
+                if (pattern.Length == 0 || pattern[0] == '#') continue;
+                var negated = pattern[0] == '!'; if (negated) pattern = pattern[1..];
+                if (pattern.Length == 0) continue;
+                var directoryOnly = pattern.EndsWith('/'); pattern = pattern.TrimEnd('/');
+                var anchored = pattern.StartsWith('/'); pattern = pattern.TrimStart('/');
+                var targetPattern = anchored || pattern.Contains('/') ? pattern : "**/" + pattern;
+                if (directoryOnly) targetPattern += "/**";
+                if (Regex.IsMatch(local, TextIndex.GlobToRegex(targetPattern), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100))) ignored = !negated;
+            }
+        }
+        return ignored;
     }
     private static bool MatchesAny(IEnumerable<string> globs, string path) => globs.Any(glob => Regex.IsMatch(path, TextIndex.GlobToRegex(glob), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100)));
     private static string Decode(byte[] bytes)
@@ -273,14 +435,41 @@ public sealed class FindFastService
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
         return new UTF8Encoding(false, true).GetString(bytes);
     }
-    private static SearchMatch CreateMatch(string rootId, IndexedFile file, int offset, int length, int context)
+    private static async Task<(string Hash, int[] LineStarts, string[] Trigrams)> AnalyzeLargeFileAsync(string path, CancellationToken token)
+    {
+        string hash;
+        await using (var bytes = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536, true))
+            hash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(bytes, token));
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536, true);
+        using var reader = new StreamReader(stream, new UTF8Encoding(false, true), true, 65536);
+        var buffer = new char[65536]; var carry = string.Empty; var offset = 0;
+        var starts = new List<int> { 0 }; var trigrams = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(), token); if (read == 0) break;
+            for (var i = 0; i < read; i++) if (buffer[i] == '\n') starts.Add(offset + i + 1);
+            var window = carry + new string(buffer, 0, read);
+            foreach (var trigram in TextIndex.Trigrams(window)) trigrams.Add(trigram);
+            carry = window.Length <= 2 ? window : window[^2..]; offset += read;
+        }
+        return (hash, [.. starts], [.. trigrams]);
+    }
+    private static SearchMatch CreateMatch(string rootId, IndexedFile file, string content, int offset, int length, int context)
     {
         var (line, column) = TextIndex.OffsetToPosition(file.LineStarts, offset);
-        var lines = SplitLines(file.Content);
+        var lines = SplitLines(content);
         var before = lines.Skip(Math.Max(0, line - 1 - context)).Take(Math.Min(context, line - 1)).ToArray();
         var text = lines.ElementAtOrDefault(line - 1) ?? string.Empty;
         var after = lines.Skip(line).Take(context).ToArray();
-        return new(rootId, file.Path, line, column, file.Content.Substring(offset, length), before, text, after);
+        return new(rootId, file.Path, line, column, content.Substring(offset, length), before, text, after);
+    }
+    private SearchMatch CreateStreamingMatch(RootSnapshot snapshot, IndexedFile file, int offset, string match, int context, CancellationToken token)
+    {
+        var (line, column) = TextIndex.OffsetToPosition(file.LineStarts, offset); var first = Math.Max(1, line - context);
+        var lines = _store.ReadLinesAsync(snapshot.Root.RootId, snapshot.Root.Version, file.FileId, first, context * 2 + 1, token).GetAwaiter().GetResult();
+        var current = line - first; var before = lines.Take(current).ToArray(); var text = lines.ElementAtOrDefault(current) ?? string.Empty;
+        var after = lines.Skip(current + 1).Take(context).ToArray();
+        return new(snapshot.Root.RootId, file.Path, line, column, match, before, text, after);
     }
     private static string[] SplitLines(string content) => content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
     private static bool IsWholeWord(string text, int offset, int length) =>
@@ -310,4 +499,43 @@ public sealed class FindFastService
     }
     private static StringComparison PathComparison => OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
     private static StringComparer PathComparer => OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+    private Task SaveCatalogAsync(CancellationToken token) => _catalog.SaveAsync(_snapshots.Values.Select(x => x.Root), token);
+
+    private void StartWatcher(RootDefinition root)
+    {
+        if (!Directory.Exists(root.Path) || _watchers.ContainsKey(root.RootId)) return;
+        var watcher = new FileSystemWatcher(root.Path) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size };
+        FileSystemEventHandler changed = (_, _) => Debounce(root.RootId);
+        RenamedEventHandler renamed = (_, _) => Debounce(root.RootId);
+        watcher.Created += changed; watcher.Changed += changed; watcher.Deleted += changed; watcher.Renamed += renamed;
+        watcher.Error += (_, _) => Debounce(root.RootId);
+        watcher.EnableRaisingEvents = true;
+        if (!_watchers.TryAdd(root.RootId, watcher)) watcher.Dispose();
+    }
+
+    private void Debounce(string rootId)
+    {
+        var next = new CancellationTokenSource();
+        var previous = _debounces.AddOrUpdate(rootId, next, (_, old) => { old.Cancel(); old.Dispose(); return next; });
+        _ = previous;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(500, next.Token); await IndexUpdateAsync(rootId, false, next.Token); }
+            catch (Exception ex) when (ex is OperationCanceledException or KeyNotFoundException or IOException) { }
+            finally { _debounces.TryRemove(new KeyValuePair<string, CancellationTokenSource>(rootId, next)); next.Dispose(); }
+        });
+    }
+
+    private void ReconcileAll()
+    {
+        foreach (var rootId in _snapshots.Keys) Debounce(rootId);
+    }
+
+    public void Dispose()
+    {
+        _reconcileTimer.Dispose();
+        foreach (var watcher in _watchers.Values) watcher.Dispose();
+        foreach (var cancellation in _debounces.Values) { cancellation.Cancel(); cancellation.Dispose(); }
+        _watchers.Clear(); _debounces.Clear();
+    }
 }

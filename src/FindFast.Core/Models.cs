@@ -27,6 +27,7 @@ public sealed record IndexedFile
     public required string Hash { get; init; }
     public required string Content { get; init; }
     public required int[] LineStarts { get; init; }
+    [JsonIgnore] public string? SourcePath { get; init; }
 }
 
 public sealed record RootSnapshot
@@ -35,9 +36,11 @@ public sealed record RootSnapshot
     public required RootDefinition Root { get; init; }
     public List<IndexedFile> Files { get; init; } = [];
     public Dictionary<string, List<int>> Trigrams { get; init; } = new(StringComparer.Ordinal);
+    public List<FileTombstone> Tombstones { get; init; } = [];
     [JsonIgnore] public Dictionary<int, IndexedFile> FilesById => _filesById ??= Files.ToDictionary(f => f.FileId);
     private Dictionary<int, IndexedFile>? _filesById;
 }
+public sealed record FileTombstone(int FileId, string Path, long RemovedInVersion);
 
 public sealed record SearchMatch(string RootId, string Path, int Line, int Column, string Match,
     IReadOnlyList<string> Before, string Text, IReadOnlyList<string> After);
@@ -47,6 +50,7 @@ public sealed record SearchResponse(long IndexVersion, string IndexState, QueryP
 public sealed record FileResult(string RootId, string Path, long Size, DateTimeOffset Modified);
 public sealed record FileReadResponse(string RootId, string Path, int StartLine, int EndLine,
     IReadOnlyList<string> Lines, bool Truncated, long IndexVersion);
+public sealed record MetricsSnapshot(long IndexOperations, long SearchOperations, long BytesIndexed, long FilesIndexed, long SearchElapsedMilliseconds);
 
 public sealed class RootAddOptions
 {
@@ -69,4 +73,18 @@ public sealed class SearchOptions
     public int MaxResultsPerFile { get; init; } = 25;
     public string? Cursor { get; init; }
     public int TimeoutMs { get; init; } = 5000;
+}
+
+public sealed class RegexSearchOptions
+{
+    public required string Pattern { get; init; }
+    public IReadOnlyList<string>? RootIds { get; init; }
+    public string? PathGlob { get; init; }
+    public bool CaseSensitive { get; init; } = true;
+    public int ContextLines { get; init; } = 1;
+    public int MaxResults { get; init; } = 100;
+    public int MaxResultsPerFile { get; init; } = 25;
+    public string? Cursor { get; init; }
+    public int TimeoutMs { get; init; } = 5000;
+    public int RegexTimeoutMs { get; init; } = 250;
 }

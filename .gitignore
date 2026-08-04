@@ -3,4 +3,8 @@ obj/
 .vs/
 .findfast/
 TestResults/
+.tools/
+.tools6/
+coverage/
+benchmarks/data/
 *.user

@@ -1,15 +1,28 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using FindFast.Core;
+using System.Net;
 
 var dataDirectory = Environment.GetEnvironmentVariable("FINDFAST_DATA_DIR")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FindFast");
 var service = await FindFastService.OpenAsync(dataDirectory);
-var server = new McpServer(service, Console.In, Console.Out, Console.Error);
-await server.RunAsync(CancellationToken.None);
+if (args.Length >= 2 && args[0] == "--http")
+{
+    await using var host = new HttpMcpHost(service, args[1]);
+    host.Start();
+    await Console.Error.WriteLineAsync($"FindFast HTTP MCP listening on {args[1]}");
+    await host.Completion;
+}
+else
+{
+    var server = new McpServer(service, Console.In, Console.Out, Console.Error);
+    await server.RunAsync(CancellationToken.None);
+}
 
 internal sealed class McpServer(FindFastService service, TextReader input, TextWriter output, TextWriter error)
 {
+    private readonly SemaphoreSlim _writer = new(1, 1);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, CancellationTokenSource> _active = new(StringComparer.Ordinal);
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
@@ -20,28 +33,52 @@ internal sealed class McpServer(FindFastService service, TextReader input, TextW
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        var pending = new List<Task>();
         string? line;
         while ((line = await input.ReadLineAsync(cancellationToken)) is not null)
         {
             if (string.IsNullOrWhiteSpace(line)) continue;
-            JsonNode? id = null;
             try
             {
                 var request = JsonNode.Parse(line)?.AsObject() ?? throw new JsonException("Request must be a JSON object.");
-                id = request["id"]?.DeepClone();
                 var method = request["method"]?.GetValue<string>() ?? throw new JsonException("Missing method.");
-                if (id is null && method.StartsWith("notifications/", StringComparison.Ordinal)) continue;
-                var result = await DispatchAsync(method, request["params"] as JsonObject, cancellationToken);
-                await WriteAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result }, cancellationToken);
+                if (method == "notifications/cancelled")
+                {
+                    var cancelledId = request["params"]?["requestId"];
+                    if (cancelledId is not null && _active.TryGetValue(cancelledId.ToJsonString(), out var active)) active.Cancel();
+                    continue;
+                }
+                if (request["id"] is null && method.StartsWith("notifications/", StringComparison.Ordinal)) continue;
+                var requestId = request["id"]!.ToJsonString();
+                var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _active[requestId] = requestCancellation;
+                pending.RemoveAll(x => x.IsCompleted);
+                pending.Add(Task.Run(() => ProcessRequestAsync(request, requestId, requestCancellation, cancellationToken), cancellationToken));
             }
             catch (Exception ex)
             {
                 await error.WriteLineAsync($"FindFast request failed: {ex.GetType().Name}: {ex.Message}");
-                if (id is not null)
-                    await WriteAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id,
-                        ["error"] = new JsonObject { ["code"] = ErrorCode(ex), ["message"] = ex.Message } }, cancellationToken);
             }
         }
+        await Task.WhenAll(pending);
+    }
+
+    private async Task ProcessRequestAsync(JsonObject request, string key, CancellationTokenSource requestCancellation, CancellationToken serverCancellation)
+    {
+        var id = request["id"]!.DeepClone();
+        try
+        {
+            var method = request["method"]!.GetValue<string>();
+            var result = await DispatchAsync(method, request["params"] as JsonObject, requestCancellation.Token);
+            await WriteAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result }, serverCancellation);
+        }
+        catch (Exception ex)
+        {
+            await error.WriteLineAsync($"FindFast request failed: {ex.GetType().Name}: {ex.Message}");
+            await WriteAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id,
+                ["error"] = new JsonObject { ["code"] = ex is OperationCanceledException ? -32800 : ErrorCode(ex), ["message"] = ex.Message } }, serverCancellation);
+        }
+        finally { _active.TryRemove(key, out _); requestCancellation.Dispose(); }
     }
 
     private async Task<JsonNode?> DispatchAsync(string method, JsonObject? parameters, CancellationToken cancellationToken) => method switch
@@ -66,10 +103,15 @@ internal sealed class McpServer(FindFastService service, TextReader input, TextW
             "root_remove" => Remove(RequiredString(args, "root_id")),
             "index_update" => await UpdateAsync(args, cancellationToken),
             "index_status" => service.IndexStatus(RequiredString(args, "root_id")),
+            "metrics_get" => service.GetMetrics(),
             "search_text" => service.SearchText(new SearchOptions { Query = RequiredString(args, "query"), RootIds = Strings(args, "root_ids"),
                 PathGlob = String(args, "path_glob"), CaseSensitive = Bool(args, "case_sensitive", true), WholeWord = Bool(args, "whole_word", false),
                 ContextLines = Int(args, "context_lines", 1), MaxResults = Int(args, "max_results", 100),
                 MaxResultsPerFile = Int(args, "max_results_per_file", 25), Cursor = String(args, "cursor"), TimeoutMs = Int(args, "timeout_ms", 5000) }, cancellationToken),
+            "search_regex" => service.SearchRegex(new RegexSearchOptions { Pattern = RequiredString(args, "pattern"), RootIds = Strings(args, "root_ids"),
+                PathGlob = String(args, "path_glob"), CaseSensitive = Bool(args, "case_sensitive", true), ContextLines = Int(args, "context_lines", 1),
+                MaxResults = Int(args, "max_results", 100), MaxResultsPerFile = Int(args, "max_results_per_file", 25), Cursor = String(args, "cursor"),
+                TimeoutMs = Int(args, "timeout_ms", 5000), RegexTimeoutMs = Int(args, "regex_timeout_ms", 250) }, cancellationToken),
             "files_find" => FindFiles(args, cancellationToken),
             "file_read" => service.FileRead(RequiredString(args, "root_id"), RequiredString(args, "path"),
                 Int(args, "start_line", 1), Int(args, "end_line", 200), cancellationToken),
@@ -96,8 +138,13 @@ internal sealed class McpServer(FindFastService service, TextReader input, TextW
     }
     private async Task WriteAsync(JsonObject value, CancellationToken cancellationToken)
     {
-        await output.WriteLineAsync(value.ToJsonString(Json).AsMemory(), cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await _writer.WaitAsync(cancellationToken);
+        try
+        {
+            await output.WriteLineAsync(value.ToJsonString(Json).AsMemory(), cancellationToken);
+            await output.FlushAsync(cancellationToken);
+        }
+        finally { _writer.Release(); }
     }
     private static int ErrorCode(Exception exception) => exception switch
     {
@@ -131,12 +178,53 @@ internal static class ToolDefinitions
         Tool("root_remove", "Remove a root and its index; source files are untouched.", new { root_id = S("Root identifier") }, ["root_id"]),
         Tool("index_update", "Reconcile or fully rebuild a root index.", new { root_id = S("Root identifier"), mode = S("incremental or full"), wait = B("Wait for completion; currently always true") }, ["root_id"]),
         Tool("index_status", "Return index state and version.", new { root_id = S("Root identifier") }, ["root_id"]),
+        Tool("metrics_get", "Return process-lifetime indexing and search counters.", new { }),
         Tool("search_text", "Search indexed file content for literal text.", new { query = S("Literal expression"), root_ids = A("Roots to search"), path_glob = S("Path glob"),
             case_sensitive = B("Case-sensitive match"), whole_word = B("Require word boundaries"), context_lines = I("Context lines", 0, 20),
             max_results = I("Page size", 1, 1000), max_results_per_file = I("Per-file cap", 1, 1000), cursor = S("Opaque page cursor"), timeout_ms = I("Query timeout", 1, 60000) }, ["query"]),
+        Tool("search_regex", "Search content with a dynamic regular expression and indexed literal prefilter when safe.", new { pattern = S("Regular expression"),
+            root_ids = A("Roots to search"), path_glob = S("Path glob"), case_sensitive = B("Case-sensitive match"), context_lines = I("Context lines", 0, 20),
+            max_results = I("Page size", 1, 1000), max_results_per_file = I("Per-file cap", 1, 1000), cursor = S("Opaque page cursor"),
+            timeout_ms = I("Total query timeout", 1, 60000), regex_timeout_ms = I("Per-match regex timeout", 1, 5000) }, ["pattern"]),
         Tool("files_find", "Find indexed files by path.", new { root_ids = A("Roots to search"), path_glob = S("Path glob"), query = S("Path substring"),
             max_results = I("Page size", 1, 1000), cursor = S("Opaque page cursor") }),
         Tool("file_read", "Read a bounded line range from an indexed file.", new { root_id = S("Root identifier"), path = S("Relative indexed path"),
             start_line = I("First line, one based", 1, int.MaxValue), end_line = I("Last line, inclusive", 1, int.MaxValue) }, ["root_id", "path"])
     ];
+}
+
+internal sealed class HttpMcpHost(FindFastService service, string prefix) : IAsyncDisposable
+{
+    private readonly HttpListener _listener = new(); private readonly CancellationTokenSource _stop = new(); private Task _loop = Task.CompletedTask;
+    public Task Completion => _loop;
+    public void Start()
+    {
+        _listener.Prefixes.Add(prefix.EndsWith('/') ? prefix : prefix + "/"); _listener.Start(); _loop = LoopAsync();
+    }
+    private async Task LoopAsync()
+    {
+        try
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                var context = await _listener.GetContextAsync(); _ = HandleAsync(context);
+            }
+        }
+        catch (Exception ex) when (ex is HttpListenerException or ObjectDisposedException && _stop.IsCancellationRequested) { }
+    }
+    private async Task HandleAsync(HttpListenerContext context)
+    {
+        try
+        {
+            if (context.Request.HttpMethod != "POST") { context.Response.StatusCode = 405; return; }
+            context.Response.ContentType = "application/json"; using var reader = new StreamReader(context.Request.InputStream);
+            await using var writer = new StreamWriter(context.Response.OutputStream) { AutoFlush = true };
+            await new McpServer(service, reader, writer, TextWriter.Null).RunAsync(_stop.Token);
+        }
+        finally { context.Response.Close(); }
+    }
+    public async ValueTask DisposeAsync()
+    {
+        _stop.Cancel(); _listener.Stop(); _listener.Close(); try { await _loop; } catch (OperationCanceledException) { } _stop.Dispose();
+    }
 }
