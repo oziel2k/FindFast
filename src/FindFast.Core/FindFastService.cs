@@ -54,7 +54,7 @@ public sealed class FindFastService : IDisposable
         for (var suffix = 2; _snapshots.ContainsKey(id); suffix++) id = baseId + "-" + suffix;
         var root = new RootDefinition { RootId = id, Name = options.Name ?? new DirectoryInfo(path).Name, Path = path,
             Type = Directory.Exists(Path.Combine(path, ".git")) ? "git_repository" : "directory",
-            Include = options.Include?.ToList() ?? [], Exclude = options.Exclude?.ToList() ?? [], RespectGitignore = options.RespectGitignore };
+            Include = options.Include?.ToList() ?? [], Exclude = options.Exclude?.ToList() ?? [], Extensions = NormalizeExtensions(options.Extensions), RespectGitignore = options.RespectGitignore };
         var placeholder = new RootSnapshot { Root = root };
         _snapshots[id] = placeholder;
         await SaveCatalogAsync(cancellationToken);
@@ -121,7 +121,7 @@ public sealed class FindFastService : IDisposable
                     if (fileId == 0) fileId = nextId++;
                     usedIds.Add(fileId);
                     var indexed = new IndexedFile { FileId = fileId, Path = relative, Size = info.Length,
-                        Modified = info.LastWriteTimeUtc, Hash = hash, Content = content, LineStarts = lineStarts, SourcePath = sourcePath };
+                        Modified = info.LastWriteTimeUtc, Hash = hash, Content = content, LineStarts = lineStarts, SourcePath = sourcePath ?? absolute };
                     files.Add(indexed);
                     foreach (var trigram in fileTrigrams)
                     {
@@ -393,6 +393,7 @@ public sealed class FindFastService : IDisposable
                 var relative = Path.GetRelativePath(root.Path, file).Replace('\\', '/');
                 if (MatchesAny(root.Exclude, relative) || (root.RespectGitignore && IsGitIgnored(root.Path, relative))) continue;
                 if (root.Include.Count > 0 && !MatchesAny(root.Include, relative)) continue;
+                if (root.Extensions.Count > 0 && !root.Extensions.Contains(Path.GetExtension(relative), StringComparer.OrdinalIgnoreCase)) continue;
                 yield return file;
             }
         }
@@ -429,6 +430,22 @@ public sealed class FindFastService : IDisposable
         return ignored;
     }
     private static bool MatchesAny(IEnumerable<string> globs, string path) => globs.Any(glob => Regex.IsMatch(path, TextIndex.GlobToRegex(glob), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100)));
+    public static List<string> NormalizeExtensions(IEnumerable<string>? extensions)
+    {
+        if (extensions is null) return [];
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in extensions)
+        {
+            var value = raw.Trim();
+            if (value.Length == 0 || value is "." or ".." || value.Contains('/') || value.Contains('\\') || value.IndexOfAny(['*', '?', '[', ']']) >= 0)
+                throw new ArgumentException($"Invalid extension: '{raw}'. Use values such as 'cs' or '.cs'.");
+            value = value.TrimStart('.');
+            if (value.Length == 0 || value.Any(c => !char.IsLetterOrDigit(c) && c is not '_' and not '-'))
+                throw new ArgumentException($"Invalid extension: '{raw}'. Use values such as 'cs' or '.cs'.");
+            result.Add("." + value.ToLowerInvariant());
+        }
+        return result.OrderBy(x => x, StringComparer.Ordinal).ToList();
+    }
     private static string Decode(byte[] bytes)
     {
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);

@@ -10,6 +10,7 @@ public sealed record RootDefinition
     public string Type { get; init; } = "directory";
     public List<string> Include { get; init; } = [];
     public List<string> Exclude { get; init; } = [];
+    public List<string> Extensions { get; init; } = [];
     public bool RespectGitignore { get; init; } = true;
     public string State { get; set; } = "building";
     public long Version { get; set; }
@@ -58,6 +59,7 @@ public sealed class RootAddOptions
     public string? Name { get; init; }
     public IReadOnlyList<string>? Include { get; init; }
     public IReadOnlyList<string>? Exclude { get; init; }
+    public IReadOnlyList<string>? Extensions { get; init; }
     public bool RespectGitignore { get; init; } = true;
 }
 

@@ -99,7 +99,8 @@ internal sealed class McpServer(FindFastService service, TextReader input, TextW
         {
             "roots_list" => new { roots = service.RootsList() },
             "root_add" => await service.RootAddAsync(new RootAddOptions { Path = RequiredString(args, "path"), Name = String(args, "name"),
-                Include = Strings(args, "include"), Exclude = Strings(args, "exclude"), RespectGitignore = Bool(args, "respect_gitignore", true) }, cancellationToken),
+                Include = Strings(args, "include"), Exclude = Strings(args, "exclude"), Extensions = Strings(args, "extensions"),
+                RespectGitignore = Bool(args, "respect_gitignore", true) }, cancellationToken),
             "root_remove" => Remove(RequiredString(args, "root_id")),
             "index_update" => await UpdateAsync(args, cancellationToken),
             "index_status" => service.IndexStatus(RequiredString(args, "root_id")),
@@ -174,7 +175,8 @@ internal static class ToolDefinitions
     [
         Tool("roots_list", "List registered indexed roots.", new { }),
         Tool("root_add", "Register and index a local directory.", new { path = S("Absolute directory path"), name = S("Friendly name"),
-            include = A("Include globs"), exclude = A("Exclude globs"), respect_gitignore = B("Respect root .gitignore rules") }, ["path"]),
+            include = A("Include globs"), exclude = A("Exclude globs"), extensions = A("Allowed final extensions, such as cs or .cs"),
+            respect_gitignore = B("Respect root .gitignore rules") }, ["path"]),
         Tool("root_remove", "Remove a root and its index; source files are untouched.", new { root_id = S("Root identifier") }, ["root_id"]),
         Tool("index_update", "Reconcile or fully rebuild a root index.", new { root_id = S("Root identifier"), mode = S("incremental or full"), wait = B("Wait for completion; currently always true") }, ["root_id"]),
         Tool("index_status", "Return index state and version.", new { root_id = S("Root identifier") }, ["root_id"]),

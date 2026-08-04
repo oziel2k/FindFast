@@ -230,6 +230,7 @@ public sealed class FindFastTests
     using var output = new StringWriter(); using var errors = new StringWriter();
     await new McpServer(service, input, output, errors).RunAsync(CancellationToken.None);
     var text = output.ToString(); True(text.Contains("\"protocolVersion\"")); True(text.Contains("\"search_regex\"")); True(text.Contains("\"inputSchema\""));
+    True(text.Contains("\"extensions\""));
 }
 
 [Fact] public async Task TestSegmentedLayoutAndAtomicStagingRecovery()
@@ -350,6 +351,74 @@ public sealed class FindFastTests
     await new SnapshotStore(fixture.Data).SaveAsync(snapshot); True(!File.Exists(Path.Combine(fixture.Data, "roots.json")));
     using var service = await FindFastService.OpenAsync(fixture.Data); Equal("old-install", service.RootsList().Single().RootId);
     True((await File.ReadAllTextAsync(Path.Combine(fixture.Data, "roots.json"))).Contains("old-install"));
+}
+
+[Fact] public async Task TestEmptyFilePublishesAndReopensWithoutTransientSourcePath()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllBytesAsync(Path.Combine(fixture.Root, "empty.txt"), []);
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "normal.txt"), "persistent searchable text");
+    string rootId;
+    using (var service = await FindFastService.OpenAsync(fixture.Data))
+    {
+        var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Name = "empty-regression" });
+        rootId = root.RootId; Equal(2, root.FileCount);
+        Equal(1, service.SearchText(new SearchOptions { Query = "searchable", RootIds = [rootId] }).Matches.Count);
+    }
+    var pointer = (await File.ReadAllTextAsync(Path.Combine(fixture.Data, rootId + ".current"))).Trim();
+    var segment = Path.Combine(fixture.Data, rootId + ".segments", pointer);
+    var manifest = await File.ReadAllTextAsync(Path.Combine(segment, "manifest.json"));
+    True(!manifest.Contains("source_path", StringComparison.OrdinalIgnoreCase));
+    var blobs = Directory.GetFiles(Path.Combine(segment, "content"), "*.txt.gz"); Equal(2, blobs.Length);
+    var emptyBlobFound = false;
+    foreach (var blob in blobs)
+    {
+        await using var input = File.OpenRead(blob); await using var gzip = new GZipStream(input, CompressionMode.Decompress); using var reader = new StreamReader(gzip);
+        if ((await reader.ReadToEndAsync()).Length == 0) emptyBlobFound = true;
+    }
+    True(emptyBlobFound);
+    using var reopened = await FindFastService.OpenAsync(fixture.Data);
+    Equal("ready", reopened.IndexStatus(rootId).State); Equal(2, reopened.IndexStatus(rootId).FileCount);
+    Equal(1, reopened.SearchText(new SearchOptions { Query = "persistent", RootIds = [rootId] }).Matches.Count);
+    var indexedFiles = reopened.FilesFind([rootId], null, null, 10, null, out _); Equal(2, indexedFiles.Count);
+}
+
+[Fact] public Task TestExtensionNormalizationAndValidation()
+{
+    Equal(new[] { ".cs", ".json" }, FindFastService.NormalizeExtensions(["CS", ".cs", " json "]).ToArray());
+    Throws<ArgumentException>(() => FindFastService.NormalizeExtensions(["src/.cs"]));
+    Throws<ArgumentException>(() => FindFastService.NormalizeExtensions(["*.cs"]));
+    Throws<ArgumentException>(() => FindFastService.NormalizeExtensions(["a\\b"]));
+    return Task.CompletedTask;
+}
+
+[Fact] public async Task TestExtensionFilterIsAdditionalAndCaseInsensitive()
+{
+    using var fixture = new Fixture(); Directory.CreateDirectory(Path.Combine(fixture.Root, "src", "skip")); Directory.CreateDirectory(Path.Combine(fixture.Root, "other"));
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "src", "A.CS"), "allowed-one");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "src", "b.json"), "allowed-two");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "src", "c.md"), "blocked-extension");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "src", "LICENSE"), "blocked-no-extension");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "src", "skip", "d.cs"), "blocked-exclude");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "other", "e.cs"), "blocked-include");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Include = ["src/**"], Exclude = ["src/skip/**"], Extensions = ["cs", ".JSON"] });
+    Equal(new[] { ".cs", ".json" }, root.Extensions.ToArray()); Equal(2, root.FileCount);
+    var files = service.FilesFind([root.RootId], null, null, 20, null, out _).Select(x => x.Path).Order().ToArray();
+    Equal(new[] { "src/A.CS", "src/b.json" }, files);
+}
+
+[Fact] public async Task TestEmptyAndMissingExtensionsPreserveBehaviorAndPersist()
+{
+    using var fixture = new Fixture(); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "LICENSE"), "no extension"); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.md"), "markdown");
+    string rootId;
+    using (var service = await FindFastService.OpenAsync(fixture.Data))
+    {
+        var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Extensions = [] }); rootId = root.RootId;
+        Equal(0, root.Extensions.Count); Equal(2, root.FileCount);
+    }
+    using var reopened = await FindFastService.OpenAsync(fixture.Data); Equal(0, reopened.IndexStatus(rootId).Extensions.Count); Equal(2, reopened.IndexStatus(rootId).FileCount);
+    var json = await File.ReadAllTextAsync(Path.Combine(fixture.Data, "roots.json")); True(json.Contains("\"extensions\": []"));
 }
 
 static void Equal<T>(T expected, T actual)
