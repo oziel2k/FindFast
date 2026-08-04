@@ -52,6 +52,8 @@ O relatório Cobertura será criado dentro de `TestResults` como `coverage.cober
 
 ## 4. Publicação
 
+Para instalação Windows empacotada, consulte [INSTALLER.md](INSTALLER.md). O bootstrap instala por usuário, preserva o catálogo em upgrades e registra Codex/Claude pelas CLIs oficiais quando permitido.
+
 Publicação dependente do runtime instalado:
 
 ```powershell
