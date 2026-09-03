@@ -4,36 +4,57 @@ $base=Join-Path $env:TEMP ("FindFast installer tests $([guid]::NewGuid().ToStrin
 [IO.File]::WriteAllText((Join-Path $payload 'FindFast.Server.exe'),'fake')
 $config=Join-Path $base 'config.json';@{roots=@(@{path=$root;name='Root With Spaces';extensions=@('CS','.json');include=@('src/**');exclude=@('src/bin/**');respect_gitignore=$true})}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $config -Encoding UTF8
 $installer=Join-Path $PSScriptRoot '..\Install-FindFast.ps1';$uninstaller=Join-Path $PSScriptRoot '..\Uninstall-FindFast.ps1'
+$inno=Get-Content -Raw (Join-Path $PSScriptRoot '..\FindFast.iss')
+Assert ($inno -match 'CreateInputDirPage' -and $inno -match "RootsPage.Add\('Pasta 1:'\)") 'Inno wizard collects monitored folders'
+Assert ($inno -match 'CreateWizardRootConfig' -and $inno -match 'SaveStringToFile') 'Inno wizard serializes roots configuration'
+Assert ($inno -match 'FilesAlreadyInstalled -Headless' -and $inno -match 'Flags: runhidden waituntilterminated') 'Inno bootstrap runs hidden without console prompts'
 $emptyInstall=Join-Path $base 'empty install';$emptyData=Join-Path $base 'empty data';& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $emptyInstall -DataDirectory $emptyData -SkipIndex -SkipClientRegistration
 Assert ($LASTEXITCODE -eq 0) 'headless install without roots succeeds';$emptyCatalogRaw=Get-Content -Raw (Join-Path $emptyData 'roots.json');$null=$emptyCatalogRaw|ConvertFrom-Json;Assert (($emptyCatalogRaw -replace '\s','') -eq '[]') 'empty catalog is valid JSON array'
+$legacyInstall=Join-Path $base 'legacy install';$legacyData=Join-Path $base 'legacy data';New-Item -ItemType Directory -Path $legacyData -Force|Out-Null
+$legacyRoot=[pscustomobject]@{root_id='legacy-object';name='legacy-object';path=$root;type='directory';include=[pscustomobject]@{};exclude=$null;extensions=[pscustomobject]@{};respect_gitignore=$true;state='stale';version=0;file_count=0};[IO.File]::WriteAllText((Join-Path $legacyData 'roots.json'),(ConvertTo-Json -InputObject @($legacyRoot) -Depth 5))
+& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $legacyInstall -DataDirectory $legacyData -SkipIndex -SkipClientRegistration
+$legacyCatalogRaw=Get-Content -Raw (Join-Path $legacyData 'roots.json');Assert ($LASTEXITCODE -eq 0) 'legacy malformed catalog is migrated';Assert ($legacyCatalogRaw -notmatch '"(include|exclude|extensions)"\s*:\s*(null|\{)') 'catalog collection fields are normalized to arrays'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex -SkipClientRegistration
 Assert ($LASTEXITCODE -eq 0) 'headless install succeeds';$catalog=@(Get-Content -Raw (Join-Path $data 'roots.json')|ConvertFrom-Json);Assert ($catalog.Count-eq 1) 'catalog root merged';Assert (($catalog[0].extensions -join ',')-eq'.cs,.json') 'extensions normalized';Assert (Test-Path (Join-Path $install 'FindFast.Server.exe')) 'payload installed with spaced paths'
 # Fake client CLIs prove safe argument construction and idempotence without touching real clients.
 $fakeTemplate=@'
 @echo off
+setlocal EnableDelayedExpansion
 echo %*>>"%FAKE_MCP_LOG%"
 if "%2"=="get" (
- if exist "%FAKE_MCP_STATE%.%~n0" (type "%FAKE_MCP_STATE%.%~n0" & exit /b 0) else exit /b 1
+ if exist "%FAKE_MCP_STATE%.%~n0" (
+  set /p target=<"%FAKE_MCP_STATE%.%~n0"
+  if "%~n0"=="codex" (echo {"command":"!target:\=\\!"}) else echo Command: "!target!"
+  exit /b 0
+ ) else (
+  echo No MCP server named findfast found. 1>&2
+  exit /b 1
+ )
 )
 if "%FAKE_MCP_FAIL%"=="1" if "%2"=="add" exit /b 5
-if "%2"=="add" (echo %* >"%FAKE_MCP_STATE%.%~n0" & exit /b 0)
+if "%2"=="add" (
+ set "target="
+ for %%A in (%*) do set "target=%%~A"
+ echo !target!>"%FAKE_MCP_STATE%.%~n0"
+ exit /b 0
+)
 if "%2"=="remove" (del /q "%FAKE_MCP_STATE%.%~n0" 2>nul & exit /b 0)
 exit /b 0
 '@
 [IO.File]::WriteAllText((Join-Path $fake 'codex.cmd'),$fakeTemplate);[IO.File]::WriteAllText((Join-Path $fake 'claude.cmd'),$fakeTemplate)
 $oldPath=$env:PATH;$env:PATH="$fake;$oldPath";$env:FAKE_MCP_LOG=Join-Path $base 'mcp.log';$env:FAKE_MCP_STATE=Join-Path $base 'mcp.state'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex
-$clientLog=Get-Content -Raw $env:FAKE_MCP_LOG;Assert ($clientLog -like '*--env*FINDFAST_DATA_DIR=*') 'fake CLI receives environment argument';Assert ($clientLog -like '*--transport stdio*--scope user*') 'Claude command uses official transport/scope flags';Assert ($clientLog -like "*$install*") 'installed executable path passed as one quoted argument'
-$installedExe=Join-Path $install 'FindFast.Server.exe';@{transport=@{command=$installedExe;args=@()}}|ConvertTo-Json -Depth 5|Set-Content -LiteralPath "$env:FAKE_MCP_STATE.codex";[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.claude",("Command: `"$installedExe`""))
+Assert ($LASTEXITCODE -eq 0) 'both client registrations are added and verified';$clientLog=Get-Content -Raw $env:FAKE_MCP_LOG;Assert ($clientLog -like '*--env*FINDFAST_DATA_DIR=*') 'fake CLI receives environment argument';Assert ($clientLog -like '*--transport stdio*--scope user*') 'Claude command uses official transport/scope flags';Assert ($clientLog -like "*$install*") 'installed executable path passed as one quoted argument'
+$installedExe=Join-Path $install 'FindFast.Server.exe';[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.codex",$installedExe);[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.claude",$installedExe)
 $addsBefore=([regex]::Matches($clientLog,'mcp add')).Count
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex
 $addsAfter=([regex]::Matches((Get-Content -Raw $env:FAKE_MCP_LOG),'mcp add')).Count;Assert ($addsAfter -eq $addsBefore) 'client registration parses escaped Codex JSON and Claude output'
-$divergent=Join-Path $base 'other app\FindFast.Server.exe';@{command=$divergent}|ConvertTo-Json|Set-Content "$env:FAKE_MCP_STATE.codex";$beforeConflict=Get-Content -Raw $env:FAKE_MCP_LOG
+$divergent=Join-Path $base 'other app\FindFast.Server.exe';[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.codex",$divergent);$beforeConflict=Get-Content -Raw $env:FAKE_MCP_LOG
 $conflictOut=& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex 2>&1|Out-String
 Assert ($conflictOut -like '*CONFLITO*codex*preservado*') 'divergent registration is preserved and summarized';Assert ((Get-Content -Raw $env:FAKE_MCP_LOG) -notlike "$beforeConflict*mcp remove findfast*") 'conflict does not remove without consent'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex -UpdateClientConflicts
 $afterOptIn=Get-Content -Raw $env:FAKE_MCP_LOG;Assert ($afterOptIn -like '*mcp remove findfast*') 'opt-in conflict update removes old registration';Assert (([regex]::Matches($afterOptIn,'mcp add')).Count -gt $addsAfter) 'opt-in conflict update adds replacement'
-Remove-Item "$env:FAKE_MCP_STATE.codex","$env:FAKE_MCP_STATE.claude" -Force -ErrorAction SilentlyContinue;$env:FAKE_MCP_FAIL='1';$policyOut=& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex 2>&1|Out-String;Assert ($LASTEXITCODE -eq 0) 'client policy failure does not abort install';Assert ($policyOut -like '*Falha registrando codex*' -and $policyOut -like '*Falha registrando claude*') 'client policy failures are explicit in summary';Remove-Item Env:FAKE_MCP_FAIL
+Remove-Item "$env:FAKE_MCP_STATE.codex","$env:FAKE_MCP_STATE.claude" -Force -ErrorAction SilentlyContinue;$env:FAKE_MCP_FAIL='1';$policyOut=& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex 2>&1|Out-String;Assert ($LASTEXITCODE -eq 2) 'client policy failure returns partial-success';Assert ($policyOut -like '*Falha registrando codex*' -and $policyOut -like '*Falha registrando claude*') 'client policy failures are explicit in summary';Remove-Item Env:FAKE_MCP_FAIL
 $env:PATH=$oldPath
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex -SkipClientRegistration
 $catalog=@(Get-Content -Raw (Join-Path $data 'roots.json')|ConvertFrom-Json);Assert ($catalog.Count-eq 1) 'upgrade/idempotence avoids duplicate roots'

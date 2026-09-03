@@ -74,7 +74,7 @@ claude mcp add --transport stdio --scope user --env FINDFAST_DATA_DIR=<data> fin
 claude mcp get findfast
 ```
 
-Para Codex, a saída JSON é parseada estruturalmente e o campo `command` é comparado por path canônico (inclusive JSON com barras escapadas). Para Claude, a saída de `get` é normalizada e o executável é extraído antes da comparação. Entrada existente que já aponta para o executável é mantida. Entrada divergente é relatada como conflito; só é substituída com `-UpdateClientConflicts`. Ausência da CLI ou falha de política não aborta a instalação e aparece no resumo/log. Consulte os manuais oficiais: [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp.md) e [Claude Code MCP](https://code.claude.com/docs/en/mcp).
+Para Codex, a saída JSON é parseada estruturalmente e o campo `command` é comparado por path canônico (inclusive JSON com barras escapadas). Para Claude, a saída de `get` é normalizada e o executável é extraído antes da comparação. Depois de cada `add`, o instalador executa um novo `get` e somente considera o registro concluído se o destino canônico for o executável instalado. Entrada existente que já aponta para o executável é mantida. Entrada divergente é relatada como conflito; só é substituída com `-UpdateClientConflicts`. Ausência da CLI, falha de política ou falha de verificação produz o código `2` (instalação parcial) e aparece no resumo/log. Catálogos antigos com campos de coleção `null` ou `{}` são normalizados para arrays antes da inicialização do servidor. Consulte os manuais oficiais: [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp.md) e [Claude Code MCP](https://code.claude.com/docs/en/mcp).
 
 ## Desinstalação
 

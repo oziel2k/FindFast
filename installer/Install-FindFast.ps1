@@ -21,10 +21,30 @@ function Write-Log([string]$Message) { $line = "[{0:O}] {1}" -f (Get-Date), $Mes
 function Canonical([string]$Path) { [IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
 function Normalize-Extensions($Values) {
     $result = @()
-    foreach ($raw in @($Values)) { $v = ([string]$raw).Trim(); if (!$v -or $v -match '[\\/\*\?\[\]]') { throw "Extensão inválida: '$raw'" }; $v=$v.TrimStart('.'); if($v -notmatch '^[A-Za-z0-9_-]+$'){throw "Extensão inválida: '$raw'"}; $result += ".$($v.ToLowerInvariant())" }
+    if ($null -eq $Values) { return }
+    foreach ($raw in @($Values)) { if($null-eq$raw -or $raw-is[pscustomobject] -or $raw-is[System.Collections.IDictionary]){continue}; $v = ([string]$raw).Trim(); if (!$v -or $v -match '[\\/\*\?\[\]]') { throw "Extensão inválida: '$raw'" }; $v=$v.TrimStart('.'); if($v -notmatch '^[A-Za-z0-9_-]+$'){throw "Extensão inválida: '$raw'"}; $result += ".$($v.ToLowerInvariant())" }
     @($result | Sort-Object -Unique)
 }
-function Invoke-Cli([string]$Command, [string[]]$Arguments) { $output = & $Command @Arguments 2>&1 | Out-String; [pscustomobject]@{ ExitCode=$LASTEXITCODE; Output=$output.Trim() } }
+function Normalize-StringArray($Values) {
+    if ($null -eq $Values) { return }
+    foreach ($value in @($Values)) {
+        if ($null -eq $value) { continue }
+        if ($value -is [pscustomobject] -or $value -is [System.Collections.IDictionary]) { continue }
+        $text = ([string]$value).Trim()
+        if ($text) { $text }
+    }
+}
+function Invoke-Cli([string]$Command, [string[]]$Arguments) {
+    # Native stderr becomes an ErrorRecord in Windows PowerShell. A missing MCP
+    # entry is expected here and must not abort before the subsequent add.
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Command @Arguments 2>&1 | ForEach-Object { $_.ToString() } | Out-String
+        $exitCode = $LASTEXITCODE
+        [pscustomobject]@{ ExitCode=$exitCode; Output=$output.Trim() }
+    } finally { $ErrorActionPreference = $previousPreference }
+}
 function Find-JsonCommand($Node) { if($null-eq $Node){return $null}; if($Node -is [string]){return $null}; foreach($p in $Node.PSObject.Properties){if($p.Name -eq 'command' -and $p.Value -is [string]){return $p.Value};$nested=Find-JsonCommand $p.Value;if($nested){return $nested}};return $null }
 function Get-RegisteredCommand([string]$Client,$Result) {
     if($Result.ExitCode-ne 0){return $null}
@@ -33,18 +53,23 @@ function Get-RegisteredCommand([string]$Client,$Result) {
 }
 function Register-Client([string]$Client, [string]$ExePath) {
     $command = Get-Command $Client -ErrorAction SilentlyContinue
-    if (!$command) { Write-Log "$Client não encontrado; registro postergado."; return }
+    if (!$command) { Write-Log "$Client não encontrado; registro postergado."; return $false }
     $getArgs = if($Client -eq 'codex'){@('mcp','get','findfast','--json')}else{@('mcp','get','findfast')}
     $existing = Invoke-Cli $command.Source $getArgs
     if($existing.ExitCode -eq 0) {
         $registered=Get-RegisteredCommand $Client $existing
-        if($registered-ne'__UNPARSEABLE__' -and (Canonical $registered)-ieq(Canonical $ExePath)) { Write-Log "$Client já aponta para esta instalação."; return }
-        if(!$UpdateClientConflicts) { Write-Log "CONFLITO: $Client já possui findfast divergente; preservado."; return }
-        $removed=Invoke-Cli $command.Source @('mcp','remove','findfast'); if($removed.ExitCode -ne 0){Write-Log "Falha removendo registro divergente de ${Client}: $($removed.Output)"; return}
+        if($registered-ne'__UNPARSEABLE__' -and (Canonical $registered)-ieq(Canonical $ExePath)) { Write-Log "$Client já aponta para esta instalação."; return $true }
+        if(!$UpdateClientConflicts) { Write-Log "CONFLITO: $Client já possui findfast divergente; preservado."; return $false }
+        $removed=Invoke-Cli $command.Source @('mcp','remove','findfast'); if($removed.ExitCode -ne 0){Write-Log "Falha removendo registro divergente de ${Client}: $($removed.Output)"; return $false}
     }
     $args = if($Client -eq 'codex'){@('mcp','add','findfast','--env',"FINDFAST_DATA_DIR=$DataDirectory",'--',$ExePath)}else{@('mcp','add','--transport','stdio','--scope','user','--env',"FINDFAST_DATA_DIR=$DataDirectory",'findfast','--',$ExePath)}
-    $added=Invoke-Cli $command.Source $args; if($added.ExitCode -ne 0){Write-Log "Falha registrando ${Client}: $($added.Output)"; return}
-    $verify=Invoke-Cli $command.Source $getArgs; Write-Log "$Client registro/verificação: exit=$($verify.ExitCode) $($verify.Output)"
+    $added=Invoke-Cli $command.Source $args; if($added.ExitCode -ne 0){Write-Log "Falha registrando ${Client}: $($added.Output)"; return $false}
+    $verify=Invoke-Cli $command.Source $getArgs
+    if($verify.ExitCode -ne 0){Write-Log "Falha verificando registro de ${Client}: $($verify.Output)"; return $false}
+    $verifiedCommand=Get-RegisteredCommand $Client $verify
+    if($verifiedCommand-eq'__UNPARSEABLE__' -or (Canonical $verifiedCommand)-ine(Canonical $ExePath)){Write-Log "Falha verificando registro de ${Client}: destino inesperado '$verifiedCommand'."; return $false}
+    Write-Log "$Client registrado e verificado em escopo de usuário: $verifiedCommand"
+    return $true
 }
 function Invoke-Index([string]$ExePath,[string]$RootId) {
     $request = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index_update","arguments":{"root_id":"' + $RootId.Replace('"','') + '","mode":"full","wait":true}}}'
@@ -61,10 +86,10 @@ try {
     if(!$FilesAlreadyInstalled){$stage=Join-Path $env:TEMP ("FindFast-stage-$([guid]::NewGuid().ToString('N'))"); New-Item -ItemType Directory -Path $stage|Out-Null; Copy-Item -Path (Join-Path $PayloadDirectory '*') -Destination $stage -Recurse -Force
       if(Test-Path -LiteralPath $InstallDirectory){$backup="$InstallDirectory.backup-$([guid]::NewGuid().ToString('N'))"; Move-Item -LiteralPath $InstallDirectory -Destination $backup}
       try { New-Item -ItemType Directory -Path (Split-Path $InstallDirectory) -Force|Out-Null; Move-Item -LiteralPath $stage -Destination $InstallDirectory; $installedThisRun=$true } catch { if($backup){Move-Item -LiteralPath $backup -Destination $InstallDirectory}; throw }}
-    New-Item -ItemType Directory -Path $DataDirectory -Force|Out-Null; $catalogPath=Join-Path $DataDirectory 'roots.json'; $catalog=@(); if(Test-Path -LiteralPath $catalogPath){$loadedCatalog=Get-Content -Raw -LiteralPath $catalogPath|ConvertFrom-Json; foreach($entry in @($loadedCatalog)){$catalog += $entry}}
-    $changed=@(); foreach($input in $roots){$path=Canonical $input.path; $found=$catalog|Where-Object{(Canonical $_.path)-ieq $path}|Select-Object -First 1; $ext=Normalize-Extensions $input.extensions; if(!$found){$id=([IO.Path]::GetFileName($path)-replace '[^A-Za-z0-9]+','-').Trim('-').ToLowerInvariant();if(!$id){$id='root'};$base=$id;$n=2;while($catalog.root_id -contains $id){$id="$base-$n";$n++};$found=[pscustomobject]@{root_id=$id;name=if($input.name){$input.name}else{[IO.Path]::GetFileName($path)};path=$path;type=if(Test-Path (Join-Path $path '.git')){'git_repository'}else{'directory'};include=@($input.include);exclude=@($input.exclude);extensions=$ext;respect_gitignore=if($null-ne $input.respect_gitignore){[bool]$input.respect_gitignore}else{$true};state='stale';version=0;last_updated=$null;last_error='Index is missing or unavailable.';file_count=0};$catalog += $found;$changed += $found.root_id}else{$before=($found|ConvertTo-Json -Depth 8 -Compress);$found.include=@($input.include);$found.exclude=@($input.exclude);if($found.PSObject.Properties.Name -contains 'extensions'){$found.extensions=$ext}else{$found|Add-Member -NotePropertyName extensions -NotePropertyValue $ext};$found.respect_gitignore=if($null-ne $input.respect_gitignore){[bool]$input.respect_gitignore}else{$true};if(($found|ConvertTo-Json -Depth 8 -Compress)-ne $before){$found.state='stale';$changed += $found.root_id}}}
+    New-Item -ItemType Directory -Path $DataDirectory -Force|Out-Null; $catalogPath=Join-Path $DataDirectory 'roots.json'; $catalog=@(); if(Test-Path -LiteralPath $catalogPath){$loadedCatalog=Get-Content -Raw -LiteralPath $catalogPath|ConvertFrom-Json; foreach($entry in @($loadedCatalog)){if($null-eq$entry){continue};$entry|Add-Member -NotePropertyName include -NotePropertyValue @((Normalize-StringArray $entry.include)) -Force;$entry|Add-Member -NotePropertyName exclude -NotePropertyValue @((Normalize-StringArray $entry.exclude)) -Force;$entry|Add-Member -NotePropertyName extensions -NotePropertyValue @((Normalize-Extensions (Normalize-StringArray $entry.extensions))) -Force;$catalog += $entry}}
+    $changed=@(); foreach($input in $roots){$path=Canonical $input.path; $found=$catalog|Where-Object{(Canonical $_.path)-ieq $path}|Select-Object -First 1; $ext=@(Normalize-Extensions $input.extensions); if(!$found){$id=([IO.Path]::GetFileName($path)-replace '[^A-Za-z0-9]+','-').Trim('-').ToLowerInvariant();if(!$id){$id='root'};$base=$id;$n=2;while($catalog.root_id -contains $id){$id="$base-$n";$n++};$found=[pscustomobject]@{root_id=$id;name=if($input.name){$input.name}else{[IO.Path]::GetFileName($path)};path=$path;type=if(Test-Path (Join-Path $path '.git')){'git_repository'}else{'directory'};include=@(Normalize-StringArray $input.include);exclude=@(Normalize-StringArray $input.exclude);extensions=$ext;respect_gitignore=if($null-ne $input.respect_gitignore){[bool]$input.respect_gitignore}else{$true};state='stale';version=0;last_updated=$null;last_error='Index is missing or unavailable.';file_count=0};$catalog += $found;$changed += $found.root_id}else{$before=($found|ConvertTo-Json -Depth 8 -Compress);$found.include=@(Normalize-StringArray $input.include);$found.exclude=@(Normalize-StringArray $input.exclude);$found.extensions=$ext;$found.respect_gitignore=if($null-ne $input.respect_gitignore){[bool]$input.respect_gitignore}else{$true};if(($found|ConvertTo-Json -Depth 8 -Compress)-ne $before){$found.state='stale';$changed += $found.root_id}}}
     $tmp="$catalogPath.tmp-$([guid]::NewGuid().ToString('N'))"; [IO.File]::WriteAllText($tmp,(ConvertTo-Json -InputObject @($catalog) -Depth 8),[Text.UTF8Encoding]::new($false)); if($TestFailBeforeCatalogPublish){throw 'Injected failure before catalog publication'}; Move-Item -LiteralPath $tmp -Destination $catalogPath -Force
     $exe=Join-Path $InstallDirectory 'FindFast.Server.exe'; $partial=$false; if(!$SkipIndex){foreach($id in $changed){if(!(Invoke-Index $exe $id)){$partial=$true}}}else{Write-Log 'Indexação postergada por opção.'}
-    if(!$SkipClientRegistration){Register-Client 'codex' $exe; Register-Client 'claude' $exe}
+    if(!$SkipClientRegistration){if(!(Register-Client 'codex' $exe)){$partial=$true};if(!(Register-Client 'claude' $exe)){$partial=$true}}
     if($backup){Remove-Item -LiteralPath $backup -Recurse -Force}; Write-Log "Instalação concluída. parcial=$partial log=$LogPath"; if($partial){exit 2}else{exit 0}
 } catch { Write-Log "FALHA: $($_.Exception.Message)"; if($tmp -and (Test-Path -LiteralPath $tmp)){Remove-Item -LiteralPath $tmp -Force}; if($installedThisRun -and (Test-Path -LiteralPath $InstallDirectory)){Remove-Item -LiteralPath $InstallDirectory -Recurse -Force}; if($backup -and (Test-Path -LiteralPath $backup)){Move-Item -LiteralPath $backup -Destination $InstallDirectory}; exit 1 }
