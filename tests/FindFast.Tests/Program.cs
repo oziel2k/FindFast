@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Text.Json;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 
 public sealed class FindFastTests
 {
@@ -233,6 +234,97 @@ public sealed class FindFastTests
     True(text.Contains("\"extensions\""));
 }
 
+[Fact] public async Task TestLiteralSearchMatchesReferenceScan()
+{
+    using var fixture = new Fixture();
+    var random = new Random(0x5F3759DF);
+    var vocabulary = new[] { "alpha", "ALPHA", "alphabet", "beta", "needle", "Needle", "gamma", "delta", "x", "_needle_" };
+    var corpus = new Dictionary<string, string>(StringComparer.Ordinal);
+    for (var fileNumber = 0; fileNumber < 24; fileNumber++)
+    {
+        var lines = Enumerable.Range(0, 10).Select(_ => string.Join(' ', Enumerable.Range(0, 10).Select(_ => vocabulary[random.Next(vocabulary.Length)])));
+        var relative = $"module-{fileNumber % 4}/file-{fileNumber:D3}.txt";
+        var content = string.Join(fileNumber % 2 == 0 ? "\n" : "\r\n", lines);
+        corpus.Add(relative, content);
+        var absolute = Path.Combine(fixture.Root, relative.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(absolute)!);
+        await File.WriteAllTextAsync(absolute, content);
+    }
+
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var cases = new[]
+    {
+        new SearchOptions { Query = "needle", RootIds = [root.RootId], MaxResults = 1000, MaxResultsPerFile = 1000 },
+        new SearchOptions { Query = "Needle", RootIds = [root.RootId], CaseSensitive = false, MaxResults = 1000, MaxResultsPerFile = 1000 },
+        new SearchOptions { Query = "x", RootIds = [root.RootId], WholeWord = true, MaxResults = 1000, MaxResultsPerFile = 1000 },
+        new SearchOptions { Query = "alpha", RootIds = [root.RootId], WholeWord = true, PathGlob = "module-2/**", MaxResults = 1000, MaxResultsPerFile = 1000 }
+    };
+
+    foreach (var options in cases)
+    {
+        var expected = ReferenceLiteral(corpus, options).ToArray();
+        var actual = service.SearchText(options).Matches.Select(MatchIdentity).ToArray();
+        Equal(expected, actual);
+    }
+}
+
+[Fact] public async Task TestRegexSearchMatchesReferenceScan()
+{
+    using var fixture = new Fixture();
+    var corpus = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["src/a.cs"] = "class Alpha12\nitem-001 item-XYZ\nTODO: first",
+        ["src/b.cs"] = "class Beta7\nitem-999\ntodo: second",
+        ["docs/readme.txt"] = "class NotInCs42\nitem-123 TODO: docs",
+        ["src/empty.cs"] = string.Empty
+    };
+    foreach (var (relative, content) in corpus)
+    {
+        var absolute = Path.Combine(fixture.Root, relative.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(absolute)!);
+        await File.WriteAllTextAsync(absolute, content);
+    }
+
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var cases = new[]
+    {
+        new RegexSearchOptions { Pattern = @"class [A-Z][a-z]+\d+", RootIds = [root.RootId], MaxResults = 1000, MaxResultsPerFile = 1000 },
+        new RegexSearchOptions { Pattern = @"item-(?:\d{3}|XYZ)", RootIds = [root.RootId], PathGlob = "src/**", MaxResults = 1000, MaxResultsPerFile = 1000 },
+        new RegexSearchOptions { Pattern = @"todo: [a-z]+", RootIds = [root.RootId], CaseSensitive = false, MaxResults = 1000, MaxResultsPerFile = 1000 }
+    };
+    foreach (var options in cases)
+    {
+        var expected = ReferenceRegex(corpus, options).ToArray();
+        var actual = service.SearchRegex(options).Matches.Select(MatchIdentity).ToArray();
+        Equal(expected, actual);
+    }
+}
+
+[Fact] public async Task TestMcpErrorsCallsAndNotifications()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.txt"), "contract needle");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var requests = string.Join('\n',
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"missing\",\"arguments\":{}}}",
+        $"{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"search_text\",\"arguments\":{{\"query\":\"needle\",\"root_ids\":[\"{root.RootId}\"]}}}}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"metrics_get\",\"arguments\":{}}}") + "\n";
+    using var input = new StringReader(requests); using var output = new StringWriter(); using var errors = new StringWriter();
+    await new McpServer(service, input, output, errors).RunAsync(CancellationToken.None);
+    var responses = output.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => JsonDocument.Parse(line)).ToDictionary(x => x.RootElement.GetProperty("id").GetInt32());
+    Equal(-32601, responses[1].RootElement.GetProperty("error").GetProperty("code").GetInt32());
+    Equal(-32601, responses[2].RootElement.GetProperty("error").GetProperty("code").GetInt32());
+    True(responses[3].RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("matches").GetArrayLength() == 1);
+    True(responses[4].RootElement.GetProperty("result").GetProperty("structuredContent").TryGetProperty("search_operations", out _));
+    Equal(4, responses.Count);
+}
+
 [Fact] public async Task TestSegmentedLayoutAndAtomicStagingRecovery()
 {
     using var fixture = new Fixture(); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.txt"), "segment needle");
@@ -420,6 +512,44 @@ public sealed class FindFastTests
     using var reopened = await FindFastService.OpenAsync(fixture.Data); Equal(0, reopened.IndexStatus(rootId).Extensions.Count); Equal(2, reopened.IndexStatus(rootId).FileCount);
     var json = await File.ReadAllTextAsync(Path.Combine(fixture.Data, "roots.json")); True(json.Contains("\"extensions\": []"));
 }
+
+static IEnumerable<string> ReferenceLiteral(IReadOnlyDictionary<string, string> corpus, SearchOptions options)
+{
+    var comparison = options.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+    foreach (var (path, content) in corpus.OrderBy(x => x.Key, StringComparer.Ordinal))
+    {
+        if (options.PathGlob is not null && !Regex.IsMatch(path, TextIndex.GlobToRegex(options.PathGlob), RegexOptions.IgnoreCase)) continue;
+        var at = 0;
+        while (at <= content.Length - options.Query.Length)
+        {
+            var found = content.IndexOf(options.Query, at, comparison); if (found < 0) break;
+            at = found + Math.Max(1, options.Query.Length);
+            if (options.WholeWord && ((found > 0 && IsWord(content[found - 1])) ||
+                (found + options.Query.Length < content.Length && IsWord(content[found + options.Query.Length])))) continue;
+            var (line, column) = TextIndex.OffsetToPosition(TextIndex.LineStarts(content), found);
+            yield return $"{path}|{line}|{column}|{content.Substring(found, options.Query.Length)}";
+        }
+    }
+}
+
+static IEnumerable<string> ReferenceRegex(IReadOnlyDictionary<string, string> corpus, RegexSearchOptions options)
+{
+    var regex = new Regex(options.Pattern, RegexOptions.CultureInvariant | (options.CaseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase),
+        TimeSpan.FromMilliseconds(options.RegexTimeoutMs));
+    foreach (var (path, content) in corpus.OrderBy(x => x.Key, StringComparer.Ordinal))
+    {
+        if (options.PathGlob is not null && !Regex.IsMatch(path, TextIndex.GlobToRegex(options.PathGlob), RegexOptions.IgnoreCase)) continue;
+        var starts = TextIndex.LineStarts(content);
+        foreach (Match match in regex.Matches(content))
+        {
+            var (line, column) = TextIndex.OffsetToPosition(starts, match.Index);
+            yield return $"{path}|{line}|{column}|{match.Value}";
+        }
+    }
+}
+
+static string MatchIdentity(SearchMatch match) => $"{match.Path}|{match.Line}|{match.Column}|{match.Match}";
+static bool IsWord(char value) => char.IsLetterOrDigit(value) || value == '_';
 
 static void Equal<T>(T expected, T actual)
 {
