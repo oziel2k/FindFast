@@ -134,7 +134,7 @@ Não coloque o data dir dentro de uma raiz rastreada. Faça backup de `roots.jso
 ]
 ```
 
-`extensions` ausente ou vazio aplica o **conjunto padrão** de extensões de código e texto (`.cs`, `.ts`, `.py`, `.sql`, `.md`, `.json`, `.yaml`, entre ~90 outras). Arquivos sem extensão, como `LICENSE`, ficam de fora nesse modo. Para indexar todo arquivo de texto, use o token `*`. Quando preenchido com extensões, aceita entradas como `cs` ou `.cs`, persiste a forma `.cs` e compara a extensão final sem diferenciar maiúsculas. Paths e globs não são aceitos; o filtro é aplicado adicionalmente a `include`, `exclude` e `.gitignore`.
+`extensions` ausente ou vazio aplica o **conjunto padrão** de extensões de código e texto (`.cs`, `.ts`, `.py`, `.sql`, `.md`, `.json`, `.yaml`, entre ~110 outras, incluindo os fontes FoxPro exportados em texto pelo FoxBin2PRG — `.prg`, `.sc2`, `.vc2`, `.fr2`, `.mn2`, `.pj2`, `.lb2`, `.fpw` — e o ecossistema Python/Cython/Fortran — `.pyi`, `.pyx`, `.pxd`, `.pxi`, `.pyf`, `.f`, `.f90`, `.f95`). Arquivos sem extensão, como `LICENSE`, ficam de fora nesse modo. Para indexar todo arquivo de texto, use o token `*`. Quando preenchido com extensões, aceita entradas como `cs` ou `.cs`, persiste a forma `.cs` e compara a extensão final sem diferenciar maiúsculas. Paths e globs não são aceitos; o filtro é aplicado adicionalmente a `include`, `exclude` e `.gitignore`.
 
 Para mudar o filtro de uma raiz já registrada, use `root_update` — remover e recadastrar descartaria o índice e os `file_id`.
 

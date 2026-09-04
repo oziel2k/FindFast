@@ -5,9 +5,29 @@ $base=Join-Path $env:TEMP ("FindFast installer tests $([guid]::NewGuid().ToStrin
 $config=Join-Path $base 'config.json';@{roots=@(@{path=$root;name='Root With Spaces';extensions=@('CS','.json');include=@('src/**');exclude=@('src/bin/**');respect_gitignore=$true})}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $config -Encoding UTF8
 $installer=Join-Path $PSScriptRoot '..\Install-FindFast.ps1';$uninstaller=Join-Path $PSScriptRoot '..\Uninstall-FindFast.ps1'
 $inno=Get-Content -Raw (Join-Path $PSScriptRoot '..\FindFast.iss')
-Assert ($inno -match 'CreateInputDirPage' -and $inno -match "RootsPage.Add\('Pasta 1:'\)") 'Inno wizard collects monitored folders'
+# Setup e binário precisam anunciar a mesma versão, ou "qual build está instalado?" fica sem resposta.
+$issVersion=[regex]::Match($inno,'#define\s+AppVersion\s+"([^"]+)"').Groups[1].Value
+$propsVersion=[regex]::Match((Get-Content -Raw (Join-Path $PSScriptRoot '..\..\Directory.Build.props')),'<Version>([^<]+)</Version>').Groups[1].Value
+Assert ($issVersion -match '^\d+\.\d+\.\d+$') "AppVersion is a three-part version ($issVersion)"
+Assert ($issVersion -eq $propsVersion) "installer and assembly versions match ($issVersion vs $propsVersion)"
+Assert ($inno -match 'RootFieldCount\s*=\s*(\d+)' -and [int]$Matches[1] -ge 5) 'Inno wizard offers at least five folder fields'
+$rootFieldCount=[int]([regex]::Match($inno,'RootFieldCount\s*=\s*(\d+)').Groups[1].Value)
+Assert ($inno -match "array\[0\.\.$($rootFieldCount-1)\] of TNewEdit" -and $inno -match "array\[0\.\.$($rootFieldCount-1)\] of TNewButton") 'folder field arrays match RootFieldCount'
+Assert (([regex]::Matches($inno,'for I := 0 to RootFieldCount - 1 do')).Count -ge 4) 'every folder loop is bounded by RootFieldCount'
+Assert ($inno -match 'BrowseForFolder' -and $inno -match 'RootBrowseButtons\[I\]\.OnClick := @RootBrowseClick') 'each folder field has a working browse button'
 Assert ($inno -match 'CreateWizardRootConfig' -and $inno -match 'SaveStringToFile') 'Inno wizard serializes roots configuration'
-Assert ($inno -match 'CreateInputQueryPage' -and $inno -match 'ExtensionsJson') 'Inno wizard collects indexable extensions'
+Assert ($inno -match 'A pasta foi informada mais de uma vez') 'Inno wizard rejects the same folder entered twice'
+Assert ($inno -match 'ExtensionsMemo\s*:\s*TNewMemo' -and $inno -match 'ExtensionsMemo\.Text := DefaultExtensionsText' -and $inno -match 'ExtensionsJson') 'Inno wizard prefills an editable extension list'
+Assert ($inno -match "Caption := 'Restaurar padr" -and $inno -match "Caption := 'Todas \(\*\)'" -and $inno -match "Caption := 'Limpar'") 'extension page exposes restore/all/clear shortcuts'
+# The suggested list is a copy of the server's set; drift would silently narrow or widen new roots.
+$issDefaults=@([regex]::Matches([regex]::Match($inno,'(?s)function DefaultExtensionsText: String;\s*begin(.*?)end;').Groups[1].Value,'\.[A-Za-z0-9_-]+')|ForEach-Object{$_.Value})
+$coreSource=Get-Content -Raw (Join-Path $PSScriptRoot '..\..\src\FindFast.Core\FindFastService.cs')
+$coreDefaults=@([regex]::Matches([regex]::Match($coreSource,'(?s)DefaultExtensions\s*=\s*\[(.*?)\];').Groups[1].Value,'"(\.[A-Za-z0-9_-]+)"')|ForEach-Object{$_.Groups[1].Value})
+Assert ($coreDefaults.Count -gt 80) 'server default extension set was located'
+Assert (($issDefaults -join ',') -eq ($coreDefaults -join ',')) 'wizard suggests exactly the server default extension set'
+# An untouched suggestion must serialize as [] so the root keeps following future server defaults.
+Assert ($inno -match 'if Body = DefaultBody then Result := '''' else Result := Body') 'unedited suggestion collapses to the server default set'
+Assert ($inno -match 'if HasStar then' -and $inno -match "Result := '\""\*\""'") 'star token is emitted alone, matching server precedence'
 Assert ($inno -match 'FilesAlreadyInstalled -Headless' -and $inno -match 'Flags: runhidden waituntilterminated') 'Inno bootstrap runs hidden without console prompts'
 $emptyInstall=Join-Path $base 'empty install';$emptyData=Join-Path $base 'empty data';& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $emptyInstall -DataDirectory $emptyData -SkipIndex -SkipClientRegistration
 Assert ($LASTEXITCODE -eq 0) 'headless install without roots succeeds';$emptyCatalogRaw=Get-Content -Raw (Join-Path $emptyData 'roots.json');$null=$emptyCatalogRaw|ConvertFrom-Json;Assert (($emptyCatalogRaw -replace '\s','') -eq '[]') 'empty catalog is valid JSON array'

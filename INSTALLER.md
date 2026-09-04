@@ -40,7 +40,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-FindFast.ps1 `
   -Headless -ConfigurationFile .\install.json
 ```
 
-O assistente gráfico pergunta as pastas e, em seguida, as extensões indexadas (separadas por vírgula). Campo vazio aplica o conjunto padrão de extensões de código e texto; `*` indexa todo arquivo de texto, inclusive os sem extensão. As mesmas extensões valem para todas as pastas informadas no assistente; para filtros distintos por raiz, use `-ConfigurationFile` ou `root_update` depois da instalação.
+O assistente gráfico oferece oito campos de pasta, cada um com botão **Procurar...**. Campos vazios são ignorados, pastas inexistentes e pastas repetidas são recusadas ali mesmo, antes de qualquer arquivo ser copiado. Para cadastrar mais de oito raízes, use `-ConfigurationFile` ou `root_add` depois da instalação.
+
+A página seguinte traz a lista de extensões indexadas já preenchida com todo o conjunto suportado pelo servidor, em um campo editável: remova o que não interessa, acrescente o que faltar e separe por vírgula, ponto e vírgula, espaço ou quebra de linha. Os botões **Restaurar padrão**, **Todas (\*)** e **Limpar** cobrem os casos extremos. Uma lista deixada exatamente como sugerida é gravada como `[]`, de modo que a raiz continua acompanhando o conjunto padrão do servidor em vez de congelar o retrato do dia da instalação; campo vazio tem o mesmo efeito. O token `*` indexa todo arquivo de texto, inclusive os sem extensão, e prevalece sobre os demais itens, como no servidor. As mesmas extensões valem para todas as pastas informadas no assistente; para filtros distintos por raiz, use `-ConfigurationFile` ou `root_update` depois da instalação.
+
+A lista sugerida é uma cópia de `FindFastService.DefaultExtensions`, e os testes do instalador comparam as duas: o servidor não pode ganhar ou perder uma extensão sem que a sugestão do assistente acompanhe.
 
 Defaults:
 
