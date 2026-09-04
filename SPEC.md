@@ -63,7 +63,7 @@ Cada raiz rastreada recebe um `root_id` estável e representa um diretório comu
 - `root_id`, nome amigável e caminho absoluto canônico.
 - tipo (`directory` ou `git_repository`).
 - regras de inclusão e exclusão.
-- filtro opcional `extensions`, normalizado como `.ext` e comparado sem distinção de caixa; ausente ou vazio aceita todas as extensões e arquivos sem extensão.
+- filtro `extensions`, normalizado como `.ext` e comparado sem distinção de caixa. Ausente ou vazio seleciona o conjunto padrão de extensões de código e texto, que exclui arquivos sem extensão; o token `*` desliga o filtro e indexa todo arquivo de texto.
 - estado: `building`, `ready`, `updating`, `stale` ou `error`.
 - versão do índice, data da última atualização e diagnóstico do último erro.
 
@@ -189,7 +189,7 @@ Lista raízes cadastradas, estado, versão, quantidade de arquivos e data da úl
 
 Cadastra uma raiz e inicia sua indexação.
 
-Entrada principal: `path`, `name?`, `include?`, `exclude?`, `extensions?`, `respect_gitignore?`. Valores de extensão aceitam `cs` ou `.cs`; paths, globs e separadores são inválidos. O filtro é adicional às demais regras.
+Entrada principal: `path`, `name?`, `include?`, `exclude?`, `extensions?`, `respect_gitignore?`. Valores de extensão aceitam `cs` ou `.cs`, além do token `*`; paths, globs e separadores são inválidos. O filtro é adicional às demais regras. `root_update` altera `include`, `exclude`, `extensions` e `respect_gitignore` de uma raiz existente e reconcilia o índice, preservando os `file_id` que continuam válidos.
 
 #### `root_remove`
 

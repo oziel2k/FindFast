@@ -8,6 +8,36 @@ namespace FindFast.Core;
 public sealed class FindFastService : IDisposable
 {
     private static readonly HashSet<string> DefaultExcluded = new(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "bin", "obj", ".findfast" };
+
+    /// <summary>Token that opts a root out of extension filtering entirely.</summary>
+    public const string AllExtensions = "*";
+
+    /// <summary>
+    /// Extensions indexed when a root does not configure its own. An empty configuration means these, not
+    /// "everything": an unfiltered root pulls in lockfiles, minified bundles, fixtures and generated output,
+    /// which inflates the index and dilutes results. Use <see cref="AllExtensions"/> to index every text file.
+    /// </summary>
+    public static readonly IReadOnlyList<string> DefaultExtensions =
+    [
+        ".adoc", ".astro", ".bash", ".bat", ".bicep", ".c", ".cc", ".cfg", ".clj", ".cljs", ".cmake", ".cmd",
+        ".conf", ".cpp", ".cs", ".csproj", ".css", ".csv", ".cxx", ".dart", ".dockerfile", ".env", ".erl",
+        ".ex", ".exs", ".fs", ".fsx", ".gitignore", ".go", ".gql", ".gradle", ".graphql", ".groovy", ".h",
+        ".hpp", ".hrl", ".hs", ".htm", ".html", ".ini", ".java", ".jl", ".jrxml", ".js", ".json", ".jsonc",
+        ".jsx", ".kt", ".kts", ".less", ".lua", ".m", ".markdown", ".md", ".mdx", ".mjs", ".mk", ".mm",
+        ".php", ".pl", ".pm", ".properties", ".proto", ".ps1", ".psd1", ".psm1", ".py", ".r", ".rb", ".rs",
+        ".rst", ".sass", ".scala", ".scss", ".sh", ".sln", ".sql", ".svelte", ".swift", ".tex", ".tf",
+        ".tfvars", ".toml", ".ts", ".tsv", ".tsx", ".txt", ".vb", ".vbproj", ".vue", ".xml", ".xsd", ".xsl",
+        ".yaml", ".yml", ".zsh"
+    ];
+    private static readonly HashSet<string> DefaultExtensionSet = new(DefaultExtensions, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Resolves the effective extension rule for a root: configured set, or the default when empty.</summary>
+    public static bool ExtensionAllowed(RootDefinition root, string path)
+    {
+        if (root.Extensions.Count == 0) return DefaultExtensionSet.Contains(Path.GetExtension(path));
+        if (root.Extensions.Contains(AllExtensions, StringComparer.Ordinal)) return true;
+        return root.Extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
+    }
     private const long MaxFileBytes = 64 * 1024 * 1024;
     private const int MaxQueryResults = 1000;
     private readonly SnapshotStore _store;
@@ -18,6 +48,9 @@ public sealed class FindFastService : IDisposable
     private readonly ConcurrentQueue<string> _regexLru = new();
     private readonly ConcurrentDictionary<string, FileSystemWatcher> _watchers = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _debounces = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, GitignoreFile> _gitignore = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CancellationTokenSource _shutdown = new();
+    private const int DebounceMilliseconds = 1000;
     private readonly Timer _reconcileTimer;
     private long _indexOperations, _searchOperations, _bytesIndexed, _filesIndexed, _searchElapsedMilliseconds;
     private FindFastService(SnapshotStore store) { _store = store; _catalog = new RootCatalog(store.DataDirectory); _reconcileTimer = new Timer(_ => ReconcileAll(), null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5)); }
@@ -66,6 +99,27 @@ public sealed class FindFastService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Changes the filters of a registered root and reconciles the index. Omitted fields keep their current
+    /// value. Removing a root and adding it back would work too, but would discard the index and every file id.
+    /// The reconciliation is incremental: files that stopped qualifying are simply not enumerated any more,
+    /// so they become tombstones and lose their postings, while newly qualifying files are read as dirty.
+    /// </summary>
+    public async Task<RootDefinition> RootUpdateAsync(string rootId, RootUpdateOptions options, CancellationToken cancellationToken = default)
+    {
+        var previous = GetSnapshot(rootId);
+        var root = previous.Root with
+        {
+            Include = options.Include?.ToList() ?? previous.Root.Include,
+            Exclude = options.Exclude?.ToList() ?? previous.Root.Exclude,
+            Extensions = options.Extensions is null ? previous.Root.Extensions : NormalizeExtensions(options.Extensions),
+            RespectGitignore = options.RespectGitignore ?? previous.Root.RespectGitignore
+        };
+        _snapshots[rootId] = previous with { Root = root };
+        await SaveCatalogAsync(cancellationToken);
+        return (await IndexUpdateAsync(rootId, false, cancellationToken)).Root;
+    }
+
     public void RootRemove(string rootId)
     {
         if (!_snapshots.TryRemove(rootId, out _)) throw new KeyNotFoundException($"Unknown root: {rootId}");
@@ -79,24 +133,54 @@ public sealed class FindFastService : IDisposable
 
     public async Task<RootSnapshot> IndexUpdateAsync(string rootId, bool full, CancellationToken cancellationToken = default)
     {
-        _ = full; // Current snapshot format rebuilds postings atomically for both modes.
         var gate = _locks.GetOrAdd(rootId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken);
         try
         {
             var previous = GetSnapshot(rootId);
-            var files = new List<IndexedFile>();
-            var postings = new Dictionary<string, List<int>>(StringComparer.Ordinal);
             var oldByPath = previous.Files.ToDictionary(x => x.Path, StringComparer.OrdinalIgnoreCase);
-            var oldByHash = previous.Files.GroupBy(x => x.Hash).ToDictionary(x => x.Key, x => new Queue<IndexedFile>(x));
-            var usedIds = new HashSet<int>();
-            var nextId = previous.Files.Select(x => x.FileId).Concat(previous.Tombstones.Select(x => x.FileId)).DefaultIfEmpty().Max() + 1;
+
+            // Classification pass: stat only. An unchanged file keeps its record, its postings and its
+            // already compressed blob, so the cost of an update tracks what changed, not the root size.
+            var retained = new List<IndexedFile>();
+            var retainedIds = new HashSet<int>();
+            var dirty = new List<(string Absolute, string Relative, FileInfo Info)>();
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var absolute in EnumerateFiles(previous.Root))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                FileInfo info;
+                try { info = new FileInfo(absolute); if (!info.Exists) continue; }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+                var relativePath = Path.GetRelativePath(previous.Root.Path, absolute).Replace('\\', '/');
+                if (!seenPaths.Add(relativePath)) continue;
+                if (!full && oldByPath.TryGetValue(relativePath, out var unchanged)
+                    && unchanged.Size == info.Length && unchanged.Modified.UtcDateTime == info.LastWriteTimeUtc)
+                {
+                    retained.Add(unchanged with { Content = string.Empty, SourcePath = absolute });
+                    retainedIds.Add(unchanged.FileId);
+                }
+                else dirty.Add((absolute, relativePath, info));
+            }
+            var removed = previous.Files.Where(x => !seenPaths.Contains(x.Path)).ToArray();
+
+            // Nothing moved: no segment, no version bump, no catalog write. This is what makes the
+            // periodic reconciliation sweep cheap enough to keep running every five minutes.
+            if (!full && dirty.Count == 0 && removed.Length == 0 && previous.Root.State == "ready") return previous;
+
+            var files = new List<IndexedFile>(retained);
+            var dirtyTrigrams = new List<(int FileId, IEnumerable<string> Trigrams)>();
+            var removedByHash = removed.GroupBy(x => x.Hash).ToDictionary(x => x.Key, x => new Queue<IndexedFile>(x), StringComparer.Ordinal);
+            // Ids of retained files are reserved before any other resolution, so a new file that happens to
+            // share content with an existing one can never take an id that is still in use.
+            var usedIds = new HashSet<int>(retainedIds);
+            var nextId = previous.Files.Select(x => x.FileId).Concat(previous.Tombstones.Select(x => x.FileId)).DefaultIfEmpty().Max() + 1;
+            long dirtyBytes = 0;
+            foreach (var (absolute, relative, info) in dirty)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    var info = new FileInfo(absolute);
                     if (info.Length > MaxFileBytes) continue;
                     string content = string.Empty; string hash; int[] lineStarts; IEnumerable<string> fileTrigrams; string? sourcePath = null;
                     if (info.Length > 1024 * 1024)
@@ -114,39 +198,61 @@ public sealed class FindFastService : IDisposable
                         content = Decode(bytes);
                         hash = TextIndex.Sha256(content); lineStarts = TextIndex.LineStarts(content); fileTrigrams = TextIndex.Trigrams(content);
                     }
-                    var relative = Path.GetRelativePath(previous.Root.Path, absolute).Replace('\\', '/');
-                    var fileId = oldByPath.TryGetValue(relative, out var old) ? old.FileId : 0;
-                    if (fileId == 0 && oldByHash.TryGetValue(hash, out var sameContent))
-                        while (sameContent.TryDequeue(out var renamed)) if (!usedIds.Contains(renamed.FileId)) { fileId = renamed.FileId; break; }
-                    if (fileId == 0) fileId = nextId++;
-                    usedIds.Add(fileId);
+                    var fileId = 0;
+                    if (oldByPath.TryGetValue(relative, out var old) && usedIds.Add(old.FileId)) fileId = old.FileId;
+                    // A rename can only inherit the id of a path that disappeared this round.
+                    if (fileId == 0 && removedByHash.TryGetValue(hash, out var sameContent))
+                        while (sameContent.TryDequeue(out var renamed)) if (usedIds.Add(renamed.FileId)) { fileId = renamed.FileId; break; }
+                    if (fileId == 0) { fileId = nextId++; usedIds.Add(fileId); }
                     var indexed = new IndexedFile { FileId = fileId, Path = relative, Size = info.Length,
                         Modified = info.LastWriteTimeUtc, Hash = hash, Content = content, LineStarts = lineStarts, SourcePath = sourcePath ?? absolute };
                     files.Add(indexed);
-                    foreach (var trigram in fileTrigrams)
-                    {
-                        if (!postings.TryGetValue(trigram, out var ids)) postings[trigram] = ids = [];
-                        ids.Add(indexed.FileId);
-                    }
+                    dirtyTrigrams.Add((fileId, fileTrigrams));
+                    dirtyBytes += info.Length;
                 }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
                 catch (DecoderFallbackException) { }
             }
+
+            // Postings are patched, not rebuilt. Every id that is not retained loses its entries: files that
+            // disappeared, files being reindexed, and files that stopped qualifying (now binary or oversized).
+            var deadIds = new HashSet<int>(previous.Files.Select(x => x.FileId).Where(id => !retainedIds.Contains(id)));
+            var postings = new Dictionary<string, List<int>>(full ? 0 : previous.Trigrams.Count, StringComparer.Ordinal);
+            // Lists reachable from the published snapshot are read lock-free by concurrent searches and must
+            // never be mutated. An untouched posting is shared by reference; anything appended to is cloned first.
+            var owned = new HashSet<string>(StringComparer.Ordinal);
+            if (!full)
+                foreach (var (trigram, ids) in previous.Trigrams)
+                {
+                    if (deadIds.Count == 0 || !ids.Any(deadIds.Contains)) { postings[trigram] = ids; continue; }
+                    var kept = ids.Where(id => !deadIds.Contains(id)).ToList();
+                    if (kept.Count > 0) { postings[trigram] = kept; owned.Add(trigram); }
+                }
+            foreach (var (fileId, trigrams) in dirtyTrigrams)
+                foreach (var trigram in trigrams)
+                {
+                    if (!postings.TryGetValue(trigram, out var ids)) { postings[trigram] = [fileId]; owned.Add(trigram); continue; }
+                    if (owned.Add(trigram)) postings[trigram] = ids = [.. ids];
+                    ids.Add(fileId);
+                }
             var root = previous.Root with { State = "ready", Version = previous.Root.Version + 1, LastUpdated = DateTimeOffset.UtcNow,
                 LastError = null, FileCount = files.Count };
             var retainedTombstones = full ? Enumerable.Empty<FileTombstone>() : previous.Tombstones;
             var tombstones = retainedTombstones.Concat(previous.Files.Where(x => !usedIds.Contains(x.FileId))
                 .Select(x => new FileTombstone(x.FileId, x.Path, root.Version))).GroupBy(x => x.FileId).Select(x => x.Last()).ToList();
             var snapshot = new RootSnapshot { Root = root, Files = files, Trigrams = postings, Tombstones = tombstones };
-            await _store.SaveAsync(snapshot, cancellationToken);
+            var reuseFrom = previous.Files.Count > 0 ? previous.Root.Version : (long?)null;
+            await _store.SaveAsync(snapshot, reuseFrom, retainedIds, cancellationToken);
             var published = snapshot with { Files = files.Select(x => x with { Content = string.Empty }).ToList() };
             _snapshots[rootId] = published;
             await SaveCatalogAsync(cancellationToken);
             Interlocked.Increment(ref _indexOperations);
-            Interlocked.Add(ref _bytesIndexed, files.Sum(x => x.Size));
-            Interlocked.Add(ref _filesIndexed, files.Count);
-            if (full) _store.Compact(rootId);
+            // Metrics report work actually performed, not the size of the root.
+            Interlocked.Add(ref _bytesIndexed, dirtyBytes);
+            Interlocked.Add(ref _filesIndexed, files.Count - retained.Count);
+            // Every update publishes a segment, so every update has to compact. Retention is unchanged.
+            _store.Compact(rootId);
             return published;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -372,7 +478,35 @@ public sealed class FindFastService : IDisposable
         var regex = new Regex(TextIndex.GlobToRegex(glob), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(250));
         return files.Where(x => regex.IsMatch(x.Path));
     }
-    private static IEnumerable<string> EnumerateFiles(RootDefinition root)
+    /// <summary>
+    /// The predicate behind <see cref="EnumerateFiles"/>, reusable for a single path. Filesystem events are
+    /// screened through it so that writes under <c>.git</c>, <c>obj</c> or a gitignored path — none of which
+    /// can ever reach the index — do not schedule an update.
+    /// </summary>
+    private bool IsIndexable(RootDefinition root, string absolutePath, bool treatAsDirectory)
+    {
+        string relative;
+        try { relative = Path.GetRelativePath(root.Path, absolutePath).Replace('\\', '/'); }
+        catch (ArgumentException) { return false; }
+        if (relative.Length == 0 || relative == "." || relative.StartsWith("../", StringComparison.Ordinal) || Path.IsPathRooted(relative)) return false;
+        var segments = relative.Split('/');
+        var ancestors = treatAsDirectory ? segments.Length : segments.Length - 1;
+        var cursor = string.Empty;
+        for (var i = 0; i < ancestors; i++)
+        {
+            if (DefaultExcluded.Contains(segments[i])) return false;
+            cursor = cursor.Length == 0 ? segments[i] : cursor + "/" + segments[i];
+            var directory = cursor + "/";
+            if (MatchesAny(root.Exclude, directory) || (root.RespectGitignore && IsGitIgnored(root.Path, directory))) return false;
+        }
+        if (treatAsDirectory) return true;
+        if (MatchesAny(root.Exclude, relative) || (root.RespectGitignore && IsGitIgnored(root.Path, relative))) return false;
+        if (root.Include.Count > 0 && !MatchesAny(root.Include, relative)) return false;
+        if (!ExtensionAllowed(root, relative)) return false;
+        return true;
+    }
+
+    private IEnumerable<string> EnumerateFiles(RootDefinition root)
     {
         var pending = new Stack<string>(); pending.Push(root.Path);
         while (pending.TryPop(out var directory))
@@ -393,12 +527,46 @@ public sealed class FindFastService : IDisposable
                 var relative = Path.GetRelativePath(root.Path, file).Replace('\\', '/');
                 if (MatchesAny(root.Exclude, relative) || (root.RespectGitignore && IsGitIgnored(root.Path, relative))) continue;
                 if (root.Include.Count > 0 && !MatchesAny(root.Include, relative)) continue;
-                if (root.Extensions.Count > 0 && !root.Extensions.Contains(Path.GetExtension(relative), StringComparer.OrdinalIgnoreCase)) continue;
+                if (!ExtensionAllowed(root, relative)) continue;
                 yield return file;
             }
         }
     }
-    private static bool IsGitIgnored(string root, string relative)
+    /// <summary>
+    /// Parsed and compiled rules for one <c>.gitignore</c>, invalidated by its own mtime and length. Without
+    /// this the rules were re-read and the globs recompiled once per candidate path; the static
+    /// <see cref="Regex"/> cache holds fifteen entries, so any larger rule set recompiled on every call.
+    /// </summary>
+    private GitignoreRule[] GitignoreRules(string ignoreFile)
+    {
+        var info = new FileInfo(ignoreFile);
+        var stamp = info.Exists ? info.LastWriteTimeUtc : DateTime.MinValue;
+        var length = info.Exists ? info.Length : -1;
+        if (_gitignore.TryGetValue(ignoreFile, out var cached) && cached.Stamp == stamp && cached.Length == length) return cached.Rules;
+        var rules = new List<GitignoreRule>();
+        if (info.Exists)
+            try
+            {
+                foreach (var raw in File.ReadLines(ignoreFile))
+                {
+                    var pattern = raw.TrimEnd();
+                    if (pattern.Length == 0 || pattern[0] == '#') continue;
+                    var negated = pattern[0] == '!'; if (negated) pattern = pattern[1..];
+                    if (pattern.Length == 0) continue;
+                    var directoryOnly = pattern.EndsWith('/'); pattern = pattern.TrimEnd('/');
+                    var anchored = pattern.StartsWith('/'); pattern = pattern.TrimStart('/');
+                    var targetPattern = anchored || pattern.Contains('/') ? pattern : "**/" + pattern;
+                    if (directoryOnly) targetPattern += "/**";
+                    rules.Add(new GitignoreRule(new Regex(TextIndex.GlobToRegex(targetPattern), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100)), negated));
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return cached?.Rules ?? []; }
+        var entry = new GitignoreFile(stamp, length, [.. rules]);
+        _gitignore[ignoreFile] = entry;
+        return entry.Rules;
+    }
+
+    private bool IsGitIgnored(string root, string relative)
     {
         var ignored = false;
         var relativeDirectory = Path.GetDirectoryName(relative.Replace('/', Path.DirectorySeparatorChar)) ?? string.Empty;
@@ -411,24 +579,16 @@ public sealed class FindFastService : IDisposable
         }
         foreach (var baseDirectory in directories)
         {
-            var ignoreFile = Path.Combine(root, baseDirectory.Replace('/', Path.DirectorySeparatorChar), ".gitignore");
-            if (!File.Exists(ignoreFile)) continue;
+            var rules = GitignoreRules(Path.Combine(root, baseDirectory.Replace('/', Path.DirectorySeparatorChar), ".gitignore"));
+            if (rules.Length == 0) continue;
             var local = baseDirectory.Length == 0 ? relative : relative.StartsWith(baseDirectory + "/", StringComparison.Ordinal) ? relative[(baseDirectory.Length + 1)..] : relative;
-            foreach (var raw in File.ReadLines(ignoreFile))
-            {
-                var pattern = raw.TrimEnd();
-                if (pattern.Length == 0 || pattern[0] == '#') continue;
-                var negated = pattern[0] == '!'; if (negated) pattern = pattern[1..];
-                if (pattern.Length == 0) continue;
-                var directoryOnly = pattern.EndsWith('/'); pattern = pattern.TrimEnd('/');
-                var anchored = pattern.StartsWith('/'); pattern = pattern.TrimStart('/');
-                var targetPattern = anchored || pattern.Contains('/') ? pattern : "**/" + pattern;
-                if (directoryOnly) targetPattern += "/**";
-                if (Regex.IsMatch(local, TextIndex.GlobToRegex(targetPattern), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100))) ignored = !negated;
-            }
+            foreach (var rule in rules) if (rule.Pattern.IsMatch(local)) ignored = !rule.Negated;
         }
         return ignored;
     }
+
+    private sealed record GitignoreRule(Regex Pattern, bool Negated);
+    private sealed record GitignoreFile(DateTime Stamp, long Length, GitignoreRule[] Rules);
     private static bool MatchesAny(IEnumerable<string> globs, string path) => globs.Any(glob => Regex.IsMatch(path, TextIndex.GlobToRegex(glob), RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(100)));
     public static List<string> NormalizeExtensions(IEnumerable<string>? extensions)
     {
@@ -437,6 +597,7 @@ public sealed class FindFastService : IDisposable
         foreach (var raw in extensions)
         {
             var value = raw.Trim();
+            if (value == AllExtensions) { result.Add(AllExtensions); continue; }
             if (value.Length == 0 || value is "." or ".." || value.Contains('/') || value.Contains('\\') || value.IndexOfAny(['*', '?', '[', ']']) >= 0)
                 throw new ArgumentException($"Invalid extension: '{raw}'. Use values such as 'cs' or '.cs'.");
             value = value.TrimStart('.');
@@ -521,24 +682,46 @@ public sealed class FindFastService : IDisposable
     private void StartWatcher(RootDefinition root)
     {
         if (!Directory.Exists(root.Path) || _watchers.ContainsKey(root.RootId)) return;
-        var watcher = new FileSystemWatcher(root.Path) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size };
-        FileSystemEventHandler changed = (_, _) => Debounce(root.RootId);
-        RenamedEventHandler renamed = (_, _) => Debounce(root.RootId);
+        var rootId = root.RootId;
+        var watcher = new FileSystemWatcher(root.Path) { IncludeSubdirectories = true, InternalBufferSize = 64 * 1024,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size };
+        FileSystemEventHandler changed = (_, e) => { if (Interesting(rootId, e.FullPath)) Debounce(rootId); };
+        RenamedEventHandler renamed = (_, e) => { if (Interesting(rootId, e.FullPath) || Interesting(rootId, e.OldFullPath)) Debounce(rootId); };
         watcher.Created += changed; watcher.Changed += changed; watcher.Deleted += changed; watcher.Renamed += renamed;
-        watcher.Error += (_, _) => Debounce(root.RootId);
+        // An overflowed buffer means events were dropped; a reconciliation sweep is the only safe answer.
+        watcher.Error += (_, _) => Debounce(rootId);
         watcher.EnableRaisingEvents = true;
-        if (!_watchers.TryAdd(root.RootId, watcher)) watcher.Dispose();
+        if (!_watchers.TryAdd(rootId, watcher)) watcher.Dispose();
+    }
+
+    private bool Interesting(string rootId, string absolutePath)
+    {
+        if (!_snapshots.TryGetValue(rootId, out var snapshot)) return false;
+        // A deleted path cannot be stat-ed, so it is judged as a file. A deleted path that would not have
+        // passed the filters was never indexed, so declining to schedule an update for it is correct.
+        try { return IsIndexable(snapshot.Root, absolutePath, Directory.Exists(absolutePath)); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return true; }
     }
 
     private void Debounce(string rootId)
     {
         var next = new CancellationTokenSource();
-        var previous = _debounces.AddOrUpdate(rootId, next, (_, old) => { old.Cancel(); old.Dispose(); return next; });
-        _ = previous;
+        _debounces.AddOrUpdate(rootId, next, (_, old) =>
+        {
+            try { old.Cancel(); old.Dispose(); } catch (ObjectDisposedException) { }
+            return next;
+        });
         _ = Task.Run(async () =>
         {
-            try { await Task.Delay(500, next.Token); await IndexUpdateAsync(rootId, false, next.Token); }
-            catch (Exception ex) when (ex is OperationCanceledException or KeyNotFoundException or IOException) { }
+            try
+            {
+                await Task.Delay(DebounceMilliseconds, next.Token);
+                // Only the waiting window is cancellable. Once indexing starts it runs to completion under the
+                // shutdown token: a further event queues another cheap incremental pass instead of discarding
+                // work already done, which is what previously kept a large root from ever converging.
+                await IndexUpdateAsync(rootId, false, _shutdown.Token);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or KeyNotFoundException or IOException or ObjectDisposedException) { }
             finally { _debounces.TryRemove(new KeyValuePair<string, CancellationTokenSource>(rootId, next)); next.Dispose(); }
         });
     }
@@ -552,7 +735,10 @@ public sealed class FindFastService : IDisposable
     {
         _reconcileTimer.Dispose();
         foreach (var watcher in _watchers.Values) watcher.Dispose();
-        foreach (var cancellation in _debounces.Values) { cancellation.Cancel(); cancellation.Dispose(); }
-        _watchers.Clear(); _debounces.Clear();
+        try { _shutdown.Cancel(); } catch (ObjectDisposedException) { }
+        foreach (var cancellation in _debounces.Values)
+            try { cancellation.Cancel(); cancellation.Dispose(); } catch (ObjectDisposedException) { }
+        _watchers.Clear(); _debounces.Clear(); _gitignore.Clear();
+        _shutdown.Dispose();
     }
 }

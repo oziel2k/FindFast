@@ -82,7 +82,8 @@ public sealed class FindFastTests
     await File.WriteAllTextAsync(Path.Combine(fixture.Root, "other", "root.txt"), "needle");
     await File.WriteAllTextAsync(Path.Combine(fixture.Root, "nested", "drop.tmp"), "needle");
     using var service = await FindFastService.OpenAsync(fixture.Data);
-    await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    // Extension filtering is off here so the assertion isolates gitignore semantics.
+    await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Extensions = [FindFastService.AllExtensions] });
     var paths = service.SearchText(new SearchOptions { Query = "needle" }).Matches.Select(x => x.Path).Order().ToArray();
     Equal(new[] { "keep.log", "other/root.txt" }, paths);
 }
@@ -172,6 +173,133 @@ public sealed class FindFastTests
         found = service.SearchText(new SearchOptions { Query = "automatic-after" }).Matches.Count == 1;
     }
     True(found);
+}
+
+[Fact] public async Task TestIncrementalNoChange()
+{
+    using var fixture = new Fixture();
+    for (var i = 0; i < 5; i++) await File.WriteAllTextAsync(Path.Combine(fixture.Root, $"f{i}.txt"), $"content {i}");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var segments = Path.Combine(fixture.Data, root.RootId + ".segments");
+    var before = root.Version;
+    var segmentsBefore = Directory.GetDirectories(segments).Length;
+    // A sweep that finds nothing changed must not publish anything at all.
+    var again = await service.IndexUpdateAsync(root.RootId, false);
+    Equal(before, again.Root.Version);
+    Equal(segmentsBefore, Directory.GetDirectories(segments).Length);
+}
+
+[Fact] public async Task TestIncrementalReadsOnlyDirtyFiles()
+{
+    using var fixture = new Fixture();
+    for (var i = 0; i < 5; i++) await File.WriteAllTextAsync(Path.Combine(fixture.Root, $"f{i}.txt"), $"content {i}");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    Equal(5L, service.GetMetrics().FilesIndexed);
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "f2.txt"), "content two changed");
+    var updated = await service.IndexUpdateAsync(root.RootId, false);
+    Equal(5, updated.Files.Count);
+    // Only the modified file is re-read; the other four are carried over untouched.
+    Equal(6L, service.GetMetrics().FilesIndexed);
+}
+
+[Fact] public async Task TestIncrementalPreservesCarriedContent()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "stable.txt"), "carried needle stays readable");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "churn.txt"), "first");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "churn.txt"), "second");
+    await service.IndexUpdateAsync(root.RootId, false);
+    // The carried blob was hard-linked or copied into the new segment, not re-derived from source.
+    Equal("carried needle stays readable", service.FileRead(root.RootId, "stable.txt", 1, 1).Lines.Single());
+    Equal(1, service.SearchText(new SearchOptions { Query = "carried needle" }).Matches.Count);
+    Equal(1, service.SearchText(new SearchOptions { Query = "second" }).Matches.Count);
+    Equal(0, service.SearchText(new SearchOptions { Query = "first" }).Matches.Count);
+}
+
+[Fact] public async Task TestDuplicateContentKeepsDistinctIds()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "original.txt"), "identical body");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    // A new file with content identical to an existing one must not inherit the id still in use.
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "copy.txt"), "identical body");
+    var updated = await service.IndexUpdateAsync(root.RootId, false);
+    Equal(2, updated.Files.Count);
+    Equal(2, updated.Files.Select(x => x.FileId).Distinct().Count());
+    Equal(2, service.SearchText(new SearchOptions { Query = "identical body" }).Matches.Count);
+}
+
+[Fact] public async Task TestSegmentsCompactedOnIncremental()
+{
+    using var fixture = new Fixture();
+    var path = Path.Combine(fixture.Root, "churn.txt");
+    await File.WriteAllTextAsync(path, "v0");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    for (var i = 1; i <= 4; i++) { await File.WriteAllTextAsync(path, $"v{i}"); await service.IndexUpdateAsync(root.RootId, false); }
+    // Incremental updates publish segments too, so they have to compact like a full rebuild does.
+    Equal(2, Directory.GetDirectories(Path.Combine(fixture.Data, root.RootId + ".segments")).Length);
+}
+
+[Fact] public async Task TestWatcherIgnoresFilteredPaths()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, ".gitignore"), "ignored/\n");
+    Directory.CreateDirectory(Path.Combine(fixture.Root, "obj"));
+    Directory.CreateDirectory(Path.Combine(fixture.Root, "ignored"));
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.txt"), "start");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var version = service.IndexStatus(root.RootId).Version;
+    for (var i = 0; i < 5; i++)
+    {
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "obj", $"build{i}.txt"), "generated");
+        await File.WriteAllTextAsync(Path.Combine(fixture.Root, "ignored", $"junk{i}.txt"), "generated");
+    }
+    await Task.Delay(2500);
+    // None of those paths can reach the index, so none of them may schedule an update.
+    Equal(version, service.IndexStatus(root.RootId).Version);
+}
+
+[Fact] public async Task TestGitignoreCacheInvalidation()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, ".gitignore"), "*.md\n");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "doc.md"), "needle");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "code.sql"), "needle");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    Equal(2, root.FileCount);
+    Equal(0, service.SearchText(new SearchOptions { Query = "needle", PathGlob = "*.md" }).Matches.Count);
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, ".gitignore"), "*.sql\n");
+    // Compiled rules are cached; the cache keys on the file's own mtime and length.
+    var updated = await service.IndexUpdateAsync(root.RootId, false);
+    Equal(new[] { ".gitignore", "doc.md" }, updated.Files.Select(x => x.Path).Order().ToArray());
+}
+
+[Fact] public async Task TestConcurrentEventDoesNotDiscardIndexing()
+{
+    using var fixture = new Fixture();
+    for (var i = 0; i < 40; i++) await File.WriteAllTextAsync(Path.Combine(fixture.Root, $"f{i}.txt"), new string('x', 4096) + $" body {i}");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    var indexing = service.IndexUpdateAsync(root.RootId, true);
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "f7.txt"), "interrupting needle");
+    await indexing;
+    var found = false;
+    for (var i = 0; i < 40 && !found; i++)
+    {
+        await Task.Delay(150);
+        found = service.SearchText(new SearchOptions { Query = "interrupting needle" }).Matches.Count == 1;
+    }
+    // The event queues another incremental pass rather than aborting the one in flight.
+    True(found);
+    Equal(40, service.IndexStatus(root.RootId).FileCount);
 }
 
 [Fact] public async Task TestStableIds()
@@ -500,17 +628,46 @@ public sealed class FindFastTests
     Equal(new[] { "src/A.CS", "src/b.json" }, files);
 }
 
-[Fact] public async Task TestEmptyAndMissingExtensionsPreserveBehaviorAndPersist()
+[Fact] public async Task TestEmptyExtensionsUseDefaultSetAndPersist()
 {
     using var fixture = new Fixture(); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "LICENSE"), "no extension"); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.md"), "markdown");
     string rootId;
     using (var service = await FindFastService.OpenAsync(fixture.Data))
     {
+        // An empty configuration selects the default extension set, so the extensionless file stays out.
         var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Extensions = [] }); rootId = root.RootId;
-        Equal(0, root.Extensions.Count); Equal(2, root.FileCount);
+        Equal(0, root.Extensions.Count); Equal(1, root.FileCount);
     }
-    using var reopened = await FindFastService.OpenAsync(fixture.Data); Equal(0, reopened.IndexStatus(rootId).Extensions.Count); Equal(2, reopened.IndexStatus(rootId).FileCount);
+    using var reopened = await FindFastService.OpenAsync(fixture.Data); Equal(0, reopened.IndexStatus(rootId).Extensions.Count); Equal(1, reopened.IndexStatus(rootId).FileCount);
     var json = await File.ReadAllTextAsync(Path.Combine(fixture.Data, "roots.json")); True(json.Contains("\"extensions\": []"));
+}
+
+[Fact] public async Task TestAllExtensionsToken()
+{
+    using var fixture = new Fixture(); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "LICENSE"), "no extension"); await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.md"), "markdown");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root, Extensions = [FindFastService.AllExtensions] });
+    Equal(2, root.FileCount);
+}
+
+[Fact] public async Task TestRootUpdateChangesExtensions()
+{
+    using var fixture = new Fixture();
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "a.md"), "needle markdown");
+    await File.WriteAllTextAsync(Path.Combine(fixture.Root, "b.sql"), "needle sql");
+    using var service = await FindFastService.OpenAsync(fixture.Data);
+    var root = await service.RootAddAsync(new RootAddOptions { Path = fixture.Root });
+    Equal(2, root.FileCount);
+    // Narrowing drops the file that no longer qualifies, and its postings go with it.
+    var narrowed = await service.RootUpdateAsync(root.RootId, new RootUpdateOptions { Extensions = ["sql"] });
+    Equal(1, narrowed.FileCount);
+    Equal(new[] { "b.sql" }, service.SearchText(new SearchOptions { Query = "needle" }).Matches.Select(x => x.Path).ToArray());
+    // Widening brings it back without recreating the root.
+    var widened = await service.RootUpdateAsync(root.RootId, new RootUpdateOptions { Extensions = ["sql", "md"] });
+    Equal(2, widened.FileCount);
+    Equal(2, service.SearchText(new SearchOptions { Query = "needle" }).Matches.Count);
+    // Other filters are untouched by an extensions-only update.
+    Equal(true, service.IndexStatus(root.RootId).RespectGitignore);
 }
 
 static IEnumerable<string> ReferenceLiteral(IReadOnlyDictionary<string, string> corpus, SearchOptions options)

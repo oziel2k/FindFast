@@ -134,7 +134,9 @@ Não coloque o data dir dentro de uma raiz rastreada. Faça backup de `roots.jso
 ]
 ```
 
-`extensions` ausente ou vazio mantém todos os arquivos, inclusive nomes sem extensão. Quando preenchido, aceita entradas como `cs` ou `.cs`, persiste a forma `.cs` e compara a extensão final sem diferenciar maiúsculas. Paths e globs não são aceitos; o filtro é aplicado adicionalmente a `include`, `exclude` e `.gitignore`.
+`extensions` ausente ou vazio aplica o **conjunto padrão** de extensões de código e texto (`.cs`, `.ts`, `.py`, `.sql`, `.md`, `.json`, `.yaml`, entre ~90 outras). Arquivos sem extensão, como `LICENSE`, ficam de fora nesse modo. Para indexar todo arquivo de texto, use o token `*`. Quando preenchido com extensões, aceita entradas como `cs` ou `.cs`, persiste a forma `.cs` e compara a extensão final sem diferenciar maiúsculas. Paths e globs não são aceitos; o filtro é aplicado adicionalmente a `include`, `exclude` e `.gitignore`.
+
+Para mudar o filtro de uma raiz já registrada, use `root_update` — remover e recadastrar descartaria o índice e os `file_id`.
 
 O exemplo representa como `C:\repositorioFox` apareceria cadastrado no data dir local. Ele não é requisito do FindFast e o diretório precisa existir antes do cadastro recomendado por `root_add`. Nesta instalação, verifique com:
 
@@ -239,6 +241,16 @@ Cadastra e indexa um diretório existente.
   "respect_gitignore": true
 }
 ```
+
+### `root_update`
+
+Altera os filtros de uma raiz já cadastrada e reconcilia o índice. Campos omitidos permanecem como estão.
+
+```json
+{ "root_id": "repositoriofox", "extensions": ["cs", "sql", "md"] }
+```
+
+Passar `"extensions": []` restaura o conjunto padrão; `["*"]` indexa todo arquivo de texto. A reconciliação é incremental: arquivos que deixaram de qualificar viram *tombstones* e perdem suas postings, e os que passaram a qualificar são lidos. Arquivos que permanecem no filtro mantêm `file_id` e conteúdo indexado.
 
 ### `root_remove`
 
@@ -362,7 +374,11 @@ Retorna contadores do processo atual: indexações, buscas, bytes e arquivos ind
 
 ## 11. Atualização automática
 
-O watcher observa criação, alteração, renomeação e exclusão recursivamente. Eventos são agrupados por aproximadamente 500 ms antes da atualização. Uma reconciliação periódica ocorre a cada cinco minutos para cobrir eventos perdidos ou overflow do watcher. `index_update` permite reconciliação explícita.
+O watcher observa criação, alteração, renomeação e exclusão recursivamente. Eventos são filtrados pelos mesmos critérios da enumeração antes de agendar qualquer trabalho: escrita em `.git`, `obj`, `bin`, `node_modules`, em caminho do `.gitignore` ou em extensão fora do filtro da raiz não dispara atualização, porque esses arquivos nunca entram no índice. Eventos que passam pelo filtro são agrupados por aproximadamente 1 s. Uma reconciliação periódica ocorre a cada cinco minutos para cobrir eventos perdidos ou overflow do watcher. `index_update` permite reconciliação explícita.
+
+Toda atualização é incremental. Uma passada compara tamanho e `mtime` de cada arquivo contra o índice atual e só relê o que mudou; arquivos inalterados mantêm registro, postings e conteúdo comprimido, que é reaproveitado por *hard link* no segmento novo. Quando nada mudou, nenhum segmento é publicado e a `version` não avança — é o que torna a varredura periódica barata. `mode: "full"` força releitura completa e descarta tombstones.
+
+Uma indexação em andamento não é abortada por eventos novos: eles agendam outra passada incremental depois, em vez de descartar o trabalho já feito.
 
 O índice é eventualmente consistente. Durante uma publicação, buscas continuam usando o último snapshot íntegro. IDs são preservados por path e, quando identificável, por conteúdo em renomeações; exclusões geram tombstones até compactação.
 

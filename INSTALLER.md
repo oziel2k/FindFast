@@ -31,12 +31,16 @@ Crie uma configuração:
 }
 ```
 
+Em `extensions`, uma lista vazia aplica o conjunto padrão de extensões de código e texto e `["*"]` indexa todo arquivo de texto, inclusive os sem extensão.
+
 Execute:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-FindFast.ps1 `
   -Headless -ConfigurationFile .\install.json
 ```
+
+O assistente gráfico pergunta as pastas e, em seguida, as extensões indexadas (separadas por vírgula). Campo vazio aplica o conjunto padrão de extensões de código e texto; `*` indexa todo arquivo de texto, inclusive os sem extensão. As mesmas extensões valem para todas as pastas informadas no assistente; para filtros distintos por raiz, use `-ConfigurationFile` ou `root_update` depois da instalação.
 
 Defaults:
 
@@ -70,9 +74,11 @@ O bootstrap detecta os executáveis e usa as CLIs, nunca edita seus arquivos dir
 codex mcp add findfast --env FINDFAST_DATA_DIR=<data> -- <FindFast.Server.exe>
 codex mcp get findfast --json
 
-claude mcp add --transport stdio --scope user --env FINDFAST_DATA_DIR=<data> findfast -- <FindFast.Server.exe>
+claude mcp add findfast --transport stdio --scope user --env FINDFAST_DATA_DIR=<data> -- <FindFast.Server.exe>
 claude mcp get findfast
 ```
+
+O nome do servidor precede as opções e `--` fecha a lista antes do executável: `claude mcp add` declara `-e/--env` como opção variádica, então qualquer token não-opção depois dela é absorvido — com o nome no fim, ele era engolido pelo `--env` e a CLI respondia `missing required argument 'commandOrUrl'`.
 
 Para Codex, a saída JSON é parseada estruturalmente e o campo `command` é comparado por path canônico (inclusive JSON com barras escapadas). Para Claude, a saída de `get` é normalizada e o executável é extraído antes da comparação. Depois de cada `add`, o instalador executa um novo `get` e somente considera o registro concluído se o destino canônico for o executável instalado. Entrada existente que já aponta para o executável é mantida. Entrada divergente é relatada como conflito; só é substituída com `-UpdateClientConflicts`. Ausência da CLI, falha de política ou falha de verificação produz o código `2` (instalação parcial) e aparece no resumo/log. Catálogos antigos com campos de coleção `null` ou `{}` são normalizados para arrays antes da inicialização do servidor. Consulte os manuais oficiais: [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp.md) e [Claude Code MCP](https://code.claude.com/docs/en/mcp).
 

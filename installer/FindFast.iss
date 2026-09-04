@@ -22,6 +22,7 @@ Name: "{group}\Desinstalar FindFast"; Filename: "{uninstallexe}"
 [Code]
 var
   RootsPage: TInputDirWizardPage;
+  ExtensionsPage: TInputQueryWizardPage;
 
 function JsonEscape(Value: String): String;
 begin
@@ -40,19 +41,78 @@ begin
   RootsPage.Add('Pasta 1:');
   RootsPage.Add('Pasta 2:');
   RootsPage.Add('Pasta 3:');
+  ExtensionsPage := CreateInputQueryPage(RootsPage.ID,
+    'Extensões indexadas',
+    'Quais tipos de arquivo devem entrar no índice.',
+    'Separe por vírgula, por exemplo: cs, sql, md. Deixe vazio para usar o conjunto padrão do FindFast, que já cobre os formatos de código e texto mais comuns. Use * para indexar todo arquivo de texto, inclusive os sem extensão.');
+  ExtensionsPage.Add('Extensões:', False);
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = RootsPage.ID) and
+  Result := ((PageID = RootsPage.ID) or (PageID = ExtensionsPage.ID)) and
     (WizardSilent or (ExpandConstant('{param:ROOTSCONFIG|}') <> ''));
+end;
+
+// Splits the comma-separated field into a JSON array body. Tokens are validated here so an invalid
+// value is reported in the wizard instead of aborting the bootstrap after files are already copied.
+function ExtensionsJson(var Invalid: String): String;
+var
+  Raw, Token: String;
+  P, I, Count: Integer;
+  Ch: Char;
+  Ok: Boolean;
+begin
+  Result := '';
+  Invalid := '';
+  Count := 0;
+  Raw := Trim(ExtensionsPage.Values[0]) + ',';
+  while Length(Raw) > 0 do
+  begin
+    P := Pos(',', Raw);
+    if P = 0 then Break;
+    Token := Trim(Copy(Raw, 1, P - 1));
+    Raw := Copy(Raw, P + 1, Length(Raw));
+    if Token = '' then Continue;
+    if Token <> '*' then
+    begin
+      if Copy(Token, 1, 1) = '.' then Token := Copy(Token, 2, Length(Token));
+      Ok := Length(Token) > 0;
+      for I := 1 to Length(Token) do
+      begin
+        Ch := Token[I];
+        if not (((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= 'A') and (Ch <= 'Z')) or
+                ((Ch >= '0') and (Ch <= '9')) or (Ch = '_') or (Ch = '-')) then Ok := False;
+      end;
+      if not Ok then
+      begin
+        Invalid := Token;
+        Result := '';
+        Exit;
+      end;
+    end;
+    if Count > 0 then Result := Result + ',';
+    Result := Result + '"' + JsonEscape(Token) + '"';
+    Count := Count + 1;
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   I: Integer;
+  Invalid: String;
 begin
   Result := True;
+  if CurPageID = ExtensionsPage.ID then
+  begin
+    ExtensionsJson(Invalid);
+    if Invalid <> '' then
+    begin
+      MsgBox('Extensão inválida: ' + Invalid + #13#10 + 'Use valores como cs, .cs ou * para todos.', mbError, MB_OK);
+      Result := False;
+    end;
+    Exit;
+  end;
   if CurPageID <> RootsPage.ID then Exit;
   for I := 0 to 2 do
     if (Trim(RootsPage.Values[I]) <> '') and not DirExists(Trim(RootsPage.Values[I])) then
@@ -66,9 +126,10 @@ end;
 function CreateWizardRootConfig: String;
 var
   I, Count: Integer;
-  Json, Value: String;
+  Json, Value, Extensions, Invalid: String;
 begin
   Result := ExpandConstant('{tmp}\findfast-roots.json');
+  Extensions := ExtensionsJson(Invalid);
   Json := '{"roots":[';
   Count := 0;
   for I := 0 to 2 do
@@ -77,7 +138,7 @@ begin
     if Value <> '' then
     begin
       if Count > 0 then Json := Json + ',';
-      Json := Json + '{"path":"' + JsonEscape(Value) + '","include":[],"exclude":[],"extensions":[],"respect_gitignore":true}';
+      Json := Json + '{"path":"' + JsonEscape(Value) + '","include":[],"exclude":[],"extensions":[' + Extensions + '],"respect_gitignore":true}';
       Count := Count + 1;
     end;
   end;

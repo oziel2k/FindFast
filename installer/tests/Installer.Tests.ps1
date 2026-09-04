@@ -7,6 +7,7 @@ $installer=Join-Path $PSScriptRoot '..\Install-FindFast.ps1';$uninstaller=Join-P
 $inno=Get-Content -Raw (Join-Path $PSScriptRoot '..\FindFast.iss')
 Assert ($inno -match 'CreateInputDirPage' -and $inno -match "RootsPage.Add\('Pasta 1:'\)") 'Inno wizard collects monitored folders'
 Assert ($inno -match 'CreateWizardRootConfig' -and $inno -match 'SaveStringToFile') 'Inno wizard serializes roots configuration'
+Assert ($inno -match 'CreateInputQueryPage' -and $inno -match 'ExtensionsJson') 'Inno wizard collects indexable extensions'
 Assert ($inno -match 'FilesAlreadyInstalled -Headless' -and $inno -match 'Flags: runhidden waituntilterminated') 'Inno bootstrap runs hidden without console prompts'
 $emptyInstall=Join-Path $base 'empty install';$emptyData=Join-Path $base 'empty data';& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $emptyInstall -DataDirectory $emptyData -SkipIndex -SkipClientRegistration
 Assert ($LASTEXITCODE -eq 0) 'headless install without roots succeeds';$emptyCatalogRaw=Get-Content -Raw (Join-Path $emptyData 'roots.json');$null=$emptyCatalogRaw|ConvertFrom-Json;Assert (($emptyCatalogRaw -replace '\s','') -eq '[]') 'empty catalog is valid JSON array'
@@ -15,7 +16,7 @@ $legacyRoot=[pscustomobject]@{root_id='legacy-object';name='legacy-object';path=
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $legacyInstall -DataDirectory $legacyData -SkipIndex -SkipClientRegistration
 $legacyCatalogRaw=Get-Content -Raw (Join-Path $legacyData 'roots.json');Assert ($LASTEXITCODE -eq 0) 'legacy malformed catalog is migrated';Assert ($legacyCatalogRaw -notmatch '"(include|exclude|extensions)"\s*:\s*(null|\{)') 'catalog collection fields are normalized to arrays'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex -SkipClientRegistration
-Assert ($LASTEXITCODE -eq 0) 'headless install succeeds';$catalog=@(Get-Content -Raw (Join-Path $data 'roots.json')|ConvertFrom-Json);Assert ($catalog.Count-eq 1) 'catalog root merged';Assert (($catalog[0].extensions -join ',')-eq'.cs,.json') 'extensions normalized';Assert (Test-Path (Join-Path $install 'FindFast.Server.exe')) 'payload installed with spaced paths'
+Assert ($LASTEXITCODE -eq 0) 'headless install succeeds';$catalog=@(Get-Content -Raw (Join-Path $data 'roots.json')|ConvertFrom-Json);Assert ($catalog.Count-eq 1) 'catalog root merged';Assert (($catalog[0].extensions -join ',')-eq'.cs,.json') 'extensions normalized';$starConfig=Join-Path $base 'star.json';@{roots=@(@{path=$root;extensions=@('*');include=@();exclude=@();respect_gitignore=$true})}|ConvertTo-Json -Depth 8|Set-Content $starConfig;& powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $starConfig -SkipIndex -SkipClientRegistration;$starCatalog=@(Get-Content -Raw (Join-Path $data 'roots.json')|ConvertFrom-Json);Assert ((@($starCatalog[0].extensions) -join ',') -eq '*') 'star token survives extension normalization';Assert (Test-Path (Join-Path $install 'FindFast.Server.exe')) 'payload installed with spaced paths'
 # Fake client CLIs prove safe argument construction and idempotence without touching real clients.
 $fakeTemplate=@'
 @echo off
@@ -45,6 +46,9 @@ exit /b 0
 $oldPath=$env:PATH;$env:PATH="$fake;$oldPath";$env:FAKE_MCP_LOG=Join-Path $base 'mcp.log';$env:FAKE_MCP_STATE=Join-Path $base 'mcp.state'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex
 Assert ($LASTEXITCODE -eq 0) 'both client registrations are added and verified';$clientLog=Get-Content -Raw $env:FAKE_MCP_LOG;Assert ($clientLog -like '*--env*FINDFAST_DATA_DIR=*') 'fake CLI receives environment argument';Assert ($clientLog -like '*--transport stdio*--scope user*') 'Claude command uses official transport/scope flags';Assert ($clientLog -like "*$install*") 'installed executable path passed as one quoted argument'
+# The name must sit immediately after 'add' and '--' must close the variadic --env list: commander
+# swallows every following non-option token into --env, which previously left commandOrUrl missing.
+Assert ($clientLog -like '*mcp add findfast --transport stdio --scope user --env *FINDFAST_DATA_DIR=* -- *') 'Claude add places the server name before options and closes --env with --'
 $installedExe=Join-Path $install 'FindFast.Server.exe';[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.codex",$installedExe);[IO.File]::WriteAllText("$env:FAKE_MCP_STATE.claude",$installedExe)
 $addsBefore=([regex]::Matches($clientLog,'mcp add')).Count
 & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Headless -PayloadDirectory $payload -InstallDirectory $install -DataDirectory $data -ConfigurationFile $config -SkipIndex

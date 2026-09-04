@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -53,7 +54,16 @@ public sealed class SnapshotStore
         return result;
     }
 
-    public async Task SaveAsync(RootSnapshot snapshot, CancellationToken cancellationToken = default)
+    public Task SaveAsync(RootSnapshot snapshot, CancellationToken cancellationToken = default)
+        => SaveAsync(snapshot, null, null, cancellationToken);
+
+    /// <summary>
+    /// Publishes a new segment. Files listed in <paramref name="reusableIds"/> are carried over from
+    /// <paramref name="reuseFromVersion"/> as a hard link (or copy) of the already compressed blob, so an
+    /// incremental update never re-reads or re-compresses unchanged content. Reuse is keyed by an explicit
+    /// set rather than by file id alone: a modified file keeps its id while its previous blob is stale.
+    /// </summary>
+    public async Task SaveAsync(RootSnapshot snapshot, long? reuseFromVersion, IReadOnlySet<int>? reusableIds, CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(_dataDirectory);
         var segmentsRoot = Path.Combine(_dataDirectory, snapshot.Root.RootId + ".segments");
@@ -62,12 +72,19 @@ public sealed class SnapshotStore
         var staging = Path.Combine(segmentsRoot, ".staging-" + segmentName);
         var published = Path.Combine(segmentsRoot, segmentName);
         Directory.CreateDirectory(Path.Combine(staging, "content"));
+        string? reuseDirectory = null;
+        if (reuseFromVersion is { } reuseVersion && reusableIds is { Count: > 0 })
+            try { reuseDirectory = Path.Combine(ResolveVersionDirectory(snapshot.Root.RootId, reuseVersion), "content"); }
+            catch (Exception ex) when (ex is InvalidOperationException or DirectoryNotFoundException) { }
         try
         {
             foreach (var file in snapshot.Files)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var target = Path.Combine(staging, "content", file.FileId + ".txt.gz");
+                var blob = file.FileId + ".txt.gz";
+                var target = Path.Combine(staging, "content", blob);
+                if (reuseDirectory is not null && reusableIds!.Contains(file.FileId)
+                    && LinkOrCopy(Path.Combine(reuseDirectory, blob), target)) continue;
                 if (file.SourcePath is not null) await WriteGzipFileAsync(target, file.SourcePath, cancellationToken);
                 else
                 {
@@ -151,6 +168,22 @@ public sealed class SnapshotStore
         }
         return results;
     }
+
+    // A hard link keeps the carried-over blob free in both time and space; Compact deleting an older
+    // segment never removes data another link still references. Non-NTFS volumes and non-Windows
+    // hosts fall back to a byte copy, which still avoids decompressing and re-compressing.
+    private static bool LinkOrCopy(string source, string target)
+    {
+        if (!File.Exists(source)) return false;
+        if (OperatingSystem.IsWindows() && CreateHardLink(target, source, IntPtr.Zero)) return true;
+        try { File.Copy(source, target); return true; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+    }
+
+    // DllImport rather than LibraryImport: the source generator requires AllowUnsafeBlocks for the whole project.
+    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLink(string target, string source, IntPtr securityAttributes);
 
     private static bool IsWordChar(char value) => char.IsLetterOrDigit(value) || value == '_';
     private string ContentPath(string rootId, long version, int fileId) => Path.Combine(ResolveVersionDirectory(rootId, version), "content", fileId + ".txt.gz");

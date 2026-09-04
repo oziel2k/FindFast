@@ -63,6 +63,14 @@ public sealed class RootAddOptions
     public bool RespectGitignore { get; init; } = true;
 }
 
+public sealed class RootUpdateOptions
+{
+    public IReadOnlyList<string>? Include { get; init; }
+    public IReadOnlyList<string>? Exclude { get; init; }
+    public IReadOnlyList<string>? Extensions { get; init; }
+    public bool? RespectGitignore { get; init; }
+}
+
 public sealed class SearchOptions
 {
     public required string Query { get; init; }

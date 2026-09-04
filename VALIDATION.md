@@ -22,6 +22,34 @@ Validation on 2026-09-03 (`DESKAMD`, Windows 10.0.26100, AMD64 Family 23 Model 1
 - Installer tests: passed.
 - Coverage after the three new tests: 90.10% lines (701/778) and 79.14% branches (535/676).
 
+## Incremental indexing validation (2026-09-03)
+
+Covers `SPEC-INDEX-INCREMENTAL.md`. Same machine and toolchain as above.
+
+- Release build: passed with zero warnings and zero errors.
+- .NET tests: 43 passed, 0 failed (33 previous plus 10 new; `TestEmptyAndMissingExtensionsPreserveBehaviorAndPersist` was rewritten as `TestEmptyExtensionsUseDefaultSetAndPersist` for the new extension contract).
+- Installer tests: passed, including the three new assertions.
+
+Synthetic corpus of 12,000 `.cs` files (30.8 MB), one phase per server process via `C:	empClaude\scripts\FindFast-Bench-Incremental.ps1`:
+
+| Phase | Wall clock | Result |
+|---|---:|---|
+| Full build (`root_add`) | 32.5 s | 12,000 files indexed |
+| Reconcile, nothing changed | 5.3 s | version unchanged, no segment published |
+| One file changed | 7.6 s | version advanced |
+| Forced `mode: full` rebuild | 36.4 s | — |
+
+Process start plus snapshot load is 1.8–2.4 s of every figure above, measured separately with a `metrics_get` call on the same data directory. Net of that baseline, a no-change reconcile costs ~3.3 s and a one-file update ~5.6 s, against ~34 s for a full rebuild.
+
+The one-file update is 4.8x faster than a full rebuild, not proportional to the change, because two costs still scale with root size and are out of scope here:
+
+- `SnapshotStore.ReadSegmentAsync` decompresses every content blob on load to verify integrity, which is the whole 1.8–2.4 s baseline.
+- Publishing a segment materializes one blob per file, so an update still creates 12,000 hard links even when a single file changed.
+
+The gitignore chain also constructs a `FileInfo` per directory level per candidate path during the sweep; caching per directory rather than per path would cut most of the remaining reconcile time.
+
+Client registration was verified end to end after the argument-order fix: `claude mcp add findfast --transport stdio --scope user --env FINDFAST_DATA_DIR=<data> -- <exe>` (arguments splatted from an array, so `--` survives PowerShell's parser) registers successfully and `claude mcp get findfast` reports `Status: ✔ Connected`.
+
 ## Performance validation
 
 Reduced validation command:
